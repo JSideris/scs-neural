@@ -6,6 +6,8 @@ import errorPropagationWgsl from "./shaders/error-propagation.compute.wgsl";
 import weightGradientComputationWgsl from "./shaders/weight-gradient-computation.compute.wgsl";
 import biasGradientComputationWgsl from "./shaders/bias-gradient-computation.compute.wgsl";
 import updateParametersWgsl from "./shaders/update-parameters.compute.wgsl";
+import forwardPassGeneticWgsl from "./shaders/forward-pass-genetic.compute.wgsl";
+import lossGeneticWgsl from "./shaders/loss-genetic.compute.wgsl";
 import InitializationMethods from "./initialization-methods";
 
 // Allows loss to be stored in a u32 rather than a f32, which is required by WGSL for atomic operations.
@@ -56,7 +58,7 @@ export default class NeuralNetwork{
 	private errorGradientsBBuffer: StorageBuffer;
 
 	private isInitialized: boolean = false;
-	private layerSizes: number[];
+	layerSizes: number[];
 	private trainingBatchSize: number;
 	private testingBatchSize: number;
 
@@ -910,5 +912,268 @@ export default class NeuralNetwork{
 			// console.log(`Epoch ${epoch + 1} loss: ${epochLoss}`);
 			props.progressCallback?.(epoch, epochLoss);
 		}
+	}
+
+	// === Genetic Evaluation (Forward + Loss per genome) ===
+	// Evaluates a population of genomes in parallel without affecting training state
+	async evaluatePopulation(props: {
+		populationSize: number,
+		batchSize: number,
+		weights: Float32Array[][], // [layerIndex>0][genomeIndex] length input_size*output_size
+		biases: Float32Array[][],  // [layerIndex>0][genomeIndex] length output_size
+		inputs: Float32Array[],    // [genomeIndex] length batchSize*inputSize
+		targets?: Float32Array[],   // [genomeIndex] length batchSize*outputSize (required for loss)
+		returnActivations?: boolean,
+		returnLoss?: boolean,
+	}){
+		if (!this.isInitialized) {
+			throw new Error("NeuralNetwork not initialized.");
+		}
+
+		const P = props.populationSize;
+		const B = props.batchSize;
+		const numLayers = this.layerSizes.length;
+
+		if (P < 1 || B < 1) {
+			throw new Error("populationSize and batchSize must be >= 1");
+		}
+		if (!props.weights || !props.biases || props.weights.length !== numLayers || props.biases.length !== numLayers) {
+			throw new Error("weights/biases must be provided per layer index (same length as layerSizes). Use empty slot at index 0.");
+		}
+		if (!props.inputs || props.inputs.length !== P) {
+			throw new Error("inputs must be provided per genome.");
+		}
+		for (let g = 0; g < P; g++) {
+			if (props.inputs[g].length !== B * this.inputSize) {
+				throw new Error(`inputs[${g}] length must equal batchSize*inputSize`);
+			}
+		}
+		if (props.returnLoss) {
+			if (!props.targets || props.targets.length !== P) {
+				throw new Error("targets must be provided per genome when returnLoss is true.");
+			}
+			for (let g = 0; g < P; g++) {
+				if (props.targets[g].length !== B * this.outputSize) {
+					throw new Error(`targets[${g}] length must equal batchSize*outputSize`);
+				}
+			}
+		}
+
+		// Pack per-layer weights/biases across genomes
+		const genWeights: StorageBuffer[] = new Array(numLayers);
+		const genBiases: StorageBuffer[] = new Array(numLayers);
+		const genZValues: StorageBuffer[] = new Array(numLayers);
+		const genActivations: StorageBuffer[] = new Array(numLayers);
+
+		// Inputs buffer is activations of layer 0
+		const packedInputs = new Float32Array(P * B * this.inputSize);
+		for (let g = 0; g < P; g++) {
+			packedInputs.set(props.inputs[g], g * B * this.inputSize);
+		}
+		genActivations[0] = new StorageBuffer({
+			dataType: "array<f32>",
+			size: P * B * this.inputSize,
+			canCopyDst: true,
+			canCopySrc: false,
+			initialValue: packedInputs,
+		});
+
+		let maxLayerSize = Math.max(...this.layerSizes);
+
+		for (let layer = 1; layer < numLayers; layer++) {
+			const inputSize = this.layerSizes[layer - 1];
+			const outputSize = this.layerSizes[layer];
+
+			// Pack weights: [genome, out, in]
+			const packedWeights = new Float32Array(P * outputSize * inputSize);
+			const packedBiases = new Float32Array(P * outputSize);
+			for (let g = 0; g < P; g++) {
+				const w = props.weights[layer][g];
+				const b = props.biases[layer][g];
+				if (!w || w.length !== inputSize * outputSize) {
+					throw new Error(`weights[layer=${layer}][${g}] size mismatch`);
+				}
+				if (!b || b.length !== outputSize) {
+					throw new Error(`biases[layer=${layer}][${g}] size mismatch`);
+				}
+				packedWeights.set(w, g * outputSize * inputSize);
+				packedBiases.set(b, g * outputSize);
+			}
+
+			genWeights[layer] = new StorageBuffer({
+				dataType: "array<f32>",
+				size: P * outputSize * inputSize,
+				canCopyDst: true,
+				canCopySrc: false,
+				initialValue: packedWeights,
+			});
+			genBiases[layer] = new StorageBuffer({
+				dataType: "array<f32>",
+				size: P * outputSize,
+				canCopyDst: true,
+				canCopySrc: false,
+				initialValue: packedBiases,
+			});
+
+			genZValues[layer] = new StorageBuffer({
+				dataType: "array<f32>",
+				size: P * B * outputSize,
+				canCopyDst: false,
+				canCopySrc: false,
+			});
+			genActivations[layer] = new StorageBuffer({
+				dataType: "array<f32>",
+				size: P * B * outputSize,
+				canCopyDst: false,
+				canCopySrc: true,
+			});
+		}
+
+		// Forward genetic shader and params buffer
+		const forwardGeneticParamsBuffer = new StorageBuffer({
+			dataType: "struct",
+			structName: "GeneticLayerParams",
+			fields: [
+				{name: "population_size", dataType: "u32"},
+				{name: "batch_size", dataType: "u32"},
+				{name: "input_size", dataType: "u32"},
+				{name: "output_size", dataType: "u32"},
+				{name: "activation_type", dataType: "u32"},
+			],
+			canCopyDst: true,
+		});
+
+		const forwardGeneticShader = new ComputeShader({
+			useExecutionCountBuffer: false,
+			useTimeBuffer: false,
+			code: forwardPassGeneticWgsl,
+			workgroupCount: [Math.ceil((P * B * maxLayerSize) / 64), 1],
+			bindingLayouts: [
+				{ default: [ { binding: forwardGeneticParamsBuffer, name: "params", type: "storage" } ] },
+				// Group 1: weights/biases per layer
+				genWeights.reduce((obj, wb, layer) => {
+					if (layer > 0) {
+						obj[`layer_${layer}`] = [
+							{ binding: genWeights[layer], name: "weights", type: "storage" },
+							{ binding: genBiases[layer], name: "biases", type: "storage" },
+						];
+					}
+					return obj;
+				}, {} as Record<string, any>),
+				// Group 2: inputs/activations per layer
+				genActivations.reduce((obj, _, layer) => {
+					if (layer > 0) {
+						obj[`layer_${layer}`] = [
+							{ binding: genActivations[layer - 1], name: "inputs", type: "storage" },
+							{ binding: genActivations[layer], name: "activations", type: "storage" },
+						];
+					}
+					return obj;
+				}, {} as Record<string, any>),
+				// Group 3: z_values per layer
+				genZValues.reduce((obj, _, layer) => {
+					if (layer > 0) {
+						obj[`layer_${layer}`] = [
+							{ binding: genZValues[layer], name: "z_values", type: "storage" },
+						];
+					}
+					return obj;
+				}, {} as Record<string, any>),
+			]
+		});
+
+		// Run forward pass across layers
+		for (let layer = 1; layer < numLayers; layer++) {
+			forwardGeneticParamsBuffer.write(new Uint32Array([
+				P,
+				B,
+				this.layerSizes[layer - 1],
+				this.layerSizes[layer],
+				layer === numLayers - 1 ? this.outputActivationType : this.hiddenActivationType,
+			]));
+			forwardGeneticShader.dispatch({
+				bindGroups: {
+					1: `layer_${layer}`,
+					2: `layer_${layer}`,
+					3: `layer_${layer}`,
+				},
+			});
+		}
+
+		// Optionally compute loss per genome
+		let losses: Float32Array = null;
+		if (props.returnLoss) {
+			// Pack targets
+			const packedTargets = new Float32Array(P * B * this.outputSize);
+			for (let g = 0; g < P; g++) {
+				packedTargets.set(props.targets[g], g * B * this.outputSize);
+			}
+			const targetsBuffer = new StorageBuffer({
+				dataType: "array<f32>",
+				size: P * B * this.outputSize,
+				canCopyDst: true,
+				canCopySrc: false,
+				initialValue: packedTargets,
+			});
+			const totalLossBuffer = new StorageBuffer({
+				dataType: "array<atomic<u32>>",
+				size: P,
+				canCopyDst: true,
+				canCopySrc: true,
+				initialValue: new Uint32Array(P).fill(0),
+			});
+			const geneticLossParamsBuffer = new StorageBuffer({
+				dataType: "struct",
+				structName: "GeneticLossParams",
+				fields: [
+					{name: "population_size", dataType: "u32"},
+					{name: "batch_size", dataType: "u32"},
+					{name: "output_size", dataType: "u32"},
+					{name: "loss_type", dataType: "u32"},
+					{name: "reduction", dataType: "u32"},
+					{name: "loss_multiplier", dataType: "u32"},
+				],
+				canCopyDst: true,
+				canCopySrc: true,
+			});
+
+			await geneticLossParamsBuffer.write(new Uint32Array([
+				P,
+				B,
+				this.outputSize,
+				0, // MSE
+				0, // mean (host will divide by batch)
+				LOSS_MULTIPLIER,
+			]));
+
+			const lossGeneticShader = new ComputeShader({
+				code: lossGeneticWgsl,
+				workgroupCount: [Math.ceil((P * B) / 64), 1],
+				bindingLayouts: [
+					{ default: [
+						{ binding: geneticLossParamsBuffer, name: "params", type: "storage" },
+						{ binding: genActivations[numLayers - 1], name: "predictions", type: "storage" },
+						{ binding: targetsBuffer, name: "targets", type: "storage" },
+						{ binding: totalLossBuffer, name: "total_loss", type: "storage" },
+					]} 
+				]
+			});
+
+			// zero totals and dispatch
+			await totalLossBuffer.write(new Uint32Array(P).fill(0));
+			lossGeneticShader.dispatch();
+			const totals = await totalLossBuffer.read() as Uint32Array;
+			losses = new Float32Array(P);
+			for (let g = 0; g < P; g++) {
+				losses[g] = totals[g] / LOSS_MULTIPLIER / B;
+			}
+		}
+
+		let activations: Float32Array = null;
+		if (props.returnActivations) {
+			activations = await genActivations[numLayers - 1].read() as Float32Array;
+		}
+
+		return { losses, activations };
 	}
 }

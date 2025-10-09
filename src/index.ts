@@ -1,133 +1,272 @@
 import NeuralNetwork, { ActivationType } from "./neural-network";
-import setupTestingUI from "./test-ui";
-import TrainingVisualizer from "./ui";
+import FlappyBirdGame from "./flappy-bird";
+
+interface Genome {
+	weights: Float32Array[];  // per layer
+	biases: Float32Array[];   // per layer
+	fitness: number;
+	isAlive: boolean;
+}
 
 async function start() {
-	const trainingBatchSize = 10;
-
+	const POPULATION_SIZE = 100;
+	const INPUT_SIZE = 5;  // bird_y, bird_velocity, next_pipe_x, pipe_top_y, pipe_bottom_y
+	const OUTPUT_SIZE = 1; // flap or not
+	
+	// Create neural network for evaluation
 	const neuralNetwork = new NeuralNetwork({
-		layerSizes: [3, 12, 12, 3],
-		trainingBatchSize: trainingBatchSize,
+		layerSizes: [INPUT_SIZE, 8, 8, OUTPUT_SIZE],
+		trainingBatchSize: 1,
 		testingBatchSize: 1,
 		outputActivationType: ActivationType.LINEAR,
 	});
 	await neuralNetwork.initialize("xavier");
 
-	const inputActivations = [];
-	const targetActivations = [];
-
-	// Testing training:
-	const totalExamples = 100;
-	const numBatches = totalExamples / trainingBatchSize;
-
-	const edgeCases = [
-		{ input: [0, 0, 0], target: [1, 1, 1] },
-		{ input: [1, 1, 1], target: [0, 0, 0] },
-		{ input: [1, 0, 0], target: [0, 1, 1] },
-		{ input: [0, 1, 0], target: [1, 0, 1] },
-		{ input: [0, 0, 1], target: [1, 1, 0] },
-	];
-
-	for (let b = 0; b < numBatches; b++) {
-		const batchInputs = [];
-		const batchTargets = [];
-		for (let i = 0; i < trainingBatchSize; i++) {
-
-			let inputs;
-			let targets;
-			if(b == 0 && i < edgeCases.length){
-				inputs = new Float32Array(edgeCases[i].input);
-				targets = new Float32Array(edgeCases[i].target);
-			}else{
-				inputs = new Float32Array([Math.random(), Math.random(), Math.random()]);
-
-				targets = new Float32Array([
-					1 - inputs[0],  // Invert R
-					1 - inputs[1],  // Invert G
-					1 - inputs[2]   // Invert B
-				]);
-			}
-
-
-			batchInputs.push(inputs);
-			batchTargets.push(targets);
-		}
-		inputActivations.push(...batchInputs);
-		targetActivations.push(...batchTargets);
+	// Initialize population
+	let population: Genome[] = [];
+	for (let i = 0; i < POPULATION_SIZE; i++) {
+		population.push(createRandomGenome(neuralNetwork.layerSizes));
 	}
 
-	// // Add these after generating random examples
+	let generation = 0;
+	let bestFitnessEver = 0;
+	let bestGenomeEver: Genome = null;
 
+	// Create game visualization
+	const game = new FlappyBirdGame(POPULATION_SIZE);
+	
+	// Main evolution loop
+	async function runGeneration() {
+		generation++;
+		game.reset();
+		
+		// Reset fitness
+		population.forEach(genome => {
+			genome.fitness = 0;
+			genome.isAlive = true;
+		});
 
-	// edgeCases.forEach(({ input, target }) => {
-	// 	inputActivations.push(new Float32Array(input));
-	// 	targetActivations.push(new Float32Array(target));
-	// });
+		let aliveCount = POPULATION_SIZE;
+		let frameCount = 0;
+		const MAX_FRAMES = 10000; // Prevent infinite loops
 
-	// Initialize the visualizer
-	const visualizer = new TrainingVisualizer({
-		title: 'Neural Network Training Progress',
-		maxDataPoints: 1000  // Keep last 1000 data points
-	});
-	visualizer.initialize();
+		// Game loop
+		while (aliveCount > 0 && frameCount < MAX_FRAMES) {
+			frameCount++;
+			
+			// Prepare inputs for all alive birds
+			const aliveIndices: number[] = [];
+			const inputs: Float32Array[] = [];
+			
+			for (let i = 0; i < POPULATION_SIZE; i++) {
+				if (population[i].isAlive) {
+					aliveIndices.push(i);
+					const state = game.getBirdState(i);
+					inputs.push(new Float32Array([
+						state.birdY / 600,           // Normalize to 0-1
+						(state.birdVelocity + 10) / 20, // Normalize velocity
+						state.nextPipeX / 400,
+						state.pipeTopY / 600,
+						state.pipeBottomY / 600,
+					]));
+				}
+			}
 
-	await neuralNetwork.train({
-		inputActivations,
-		targetActivations,
-		epochs: 1000,
-		// batchSize: trainingBatchSize,
-		learningRate: 0.01,
-		momentum: 0.9,
-		weightDecay: 0.01,
-		progressCallback: (epoch, loss) => {
-			visualizer.update(epoch, loss);
+			if (aliveIndices.length === 0) break;
+
+			// Prepare weights and biases for alive birds
+			const numLayers = neuralNetwork.layerSizes.length;
+			const weights: Float32Array[][] = new Array(numLayers);
+			const biases: Float32Array[][] = new Array(numLayers);
+			
+			weights[0] = [];
+			biases[0] = [];
+			
+			for (let layer = 1; layer < numLayers; layer++) {
+				weights[layer] = aliveIndices.map(idx => population[idx].weights[layer]);
+				biases[layer] = aliveIndices.map(idx => population[idx].biases[layer]);
+			}
+
+			// Evaluate all alive birds in parallel
+			const { activations } = await neuralNetwork.evaluatePopulation({
+				populationSize: aliveIndices.length,
+				batchSize: 1,
+				weights,
+				biases,
+				inputs,
+				returnActivations: true,
+			});
+
+			// Apply outputs and update game
+			for (let i = 0; i < aliveIndices.length; i++) {
+				const birdIndex = aliveIndices[i];
+				const output = activations[i]; // Single output value
+				
+				// If output > 0.5, flap
+				if (output > 0.5) {
+					game.flap(birdIndex);
+				}
+			}
+
+			// Update game physics
+			game.update();
+
+			// Check collisions and update fitness
+			for (let i = 0; i < POPULATION_SIZE; i++) {
+				if (population[i].isAlive) {
+					if (game.isDead(i)) {
+						population[i].isAlive = false;
+						population[i].fitness = game.getScore(i);
+						aliveCount--;
+					}
+				}
+			}
+
+			// Render every frame
+			game.render(generation, population, bestFitnessEver);
+			
+			// Small delay to make it visible
+			await new Promise(resolve => setTimeout(resolve, 1000 / 60));
 		}
-	});
 
-	// Get final stats
-	const stats = visualizer.getStats();
-	console.log('Training completed!', stats);
+		// Generation complete - assign fitness to any remaining alive birds
+		for (let i = 0; i < POPULATION_SIZE; i++) {
+			if (population[i].isAlive) {
+				population[i].fitness = game.getScore(i);
+			}
+		}
 
-	// Close the visualizer (or keep it open to view results)
-	visualizer.close();
+		// Find best genome
+		const generationBest = population.reduce((best, genome) => 
+			genome.fitness > best.fitness ? genome : best
+		);
 
-	// ADD THIS:
-console.log('=== INSPECTING LEARNED PARAMETERS ===');
-const weightsData = await neuralNetwork.layerBuffers[1].weights.read();
-const biasesData = await neuralNetwork.layerBuffers[1].biases.read();
+		if (generationBest.fitness > bestFitnessEver) {
+			bestFitnessEver = generationBest.fitness;
+			bestGenomeEver = cloneGenome(generationBest);
+		}
 
-console.log('Weights (should be close to -1 on diagonal, 0 elsewhere):');
-for(let out = 0; out < 3; out++) {
-    let row = [];
-    for(let inp = 0; inp < 3; inp++) {
-        row.push(weightsData[out * 3 + inp].toFixed(3));
-    }
-    console.log(`  Row ${out}: [${row.join(', ')}]`);
+		console.log(`Generation ${generation}: Best=${generationBest.fitness.toFixed(1)}, AllTime=${bestFitnessEver.toFixed(1)}`);
+
+		// Evolve population
+		population = evolvePopulation(population, neuralNetwork.layerSizes);
+
+		// Continue to next generation
+		setTimeout(runGeneration, 100);
+	}
+
+	runGeneration();
 }
 
-console.log('\nBiases (should be close to [1, 1, 1]):');
-console.log(`  [${Array.from(biasesData).map(b => b.toFixed(3)).join(', ')}]`);
+function createRandomGenome(layerSizes: number[]): Genome {
+	const weights: Float32Array[] = [null]; // No weights for input layer
+	const biases: Float32Array[] = [null];  // No biases for input layer
 
-// Manually compute what the network will output for edge cases
-console.log('\n=== MANUAL FORWARD PASS ===');
-const testCases = [
-    [0, 0, 0],
-    [1, 1, 1],
-    [1, 0, 0],
-];
+	for (let i = 1; i < layerSizes.length; i++) {
+		const inputSize = layerSizes[i - 1];
+		const outputSize = layerSizes[i];
+		
+		// Xavier initialization
+		const scale = Math.sqrt(2.0 / inputSize);
+		const w = new Float32Array(inputSize * outputSize);
+		const b = new Float32Array(outputSize);
+		
+		for (let j = 0; j < w.length; j++) {
+			w[j] = (Math.random() * 2 - 1) * scale;
+		}
+		for (let j = 0; j < b.length; j++) {
+			b[j] = (Math.random() * 2 - 1) * 0.1;
+		}
+		
+		weights.push(w);
+		biases.push(b);
+	}
 
-testCases.forEach(input => {
-    let output = [0, 0, 0];
-    for(let out = 0; out < 3; out++) {
-        for(let inp = 0; inp < 3; inp++) {
-            output[out] += weightsData[out * 3 + inp] * input[inp];
-        }
-        output[out] += biasesData[out];
-    }
-    console.log(`Input [${input}] → Output [${output.map(v => v.toFixed(3))}]`);
-});
+	return { weights, biases, fitness: 0, isAlive: true };
+}
 
-	setupTestingUI(neuralNetwork);
+function cloneGenome(genome: Genome): Genome {
+	return {
+		weights: genome.weights.map(w => w ? new Float32Array(w) : null),
+		biases: genome.biases.map(b => b ? new Float32Array(b) : null),
+		fitness: genome.fitness,
+		isAlive: genome.isAlive,
+	};
+}
+
+function evolvePopulation(population: Genome[], layerSizes: number[]): Genome[] {
+	// Sort by fitness
+	const sorted = [...population].sort((a, b) => b.fitness - a.fitness);
+	
+	// Keep top 10%
+	const eliteCount = Math.floor(population.length * 0.1);
+	const newPopulation: Genome[] = sorted.slice(0, eliteCount).map(cloneGenome);
+
+	// Fill rest with offspring
+	while (newPopulation.length < population.length) {
+		// Tournament selection
+		const parent1 = tournamentSelect(sorted, 5);
+		const parent2 = tournamentSelect(sorted, 5);
+		
+		const child = crossover(parent1, parent2);
+		mutate(child, 0.1, 0.2); // 10% mutation rate, 20% mutation strength
+		
+		newPopulation.push(child);
+	}
+
+	return newPopulation;
+}
+
+function tournamentSelect(population: Genome[], tournamentSize: number): Genome {
+	let best = population[Math.floor(Math.random() * population.length)];
+	for (let i = 1; i < tournamentSize; i++) {
+		const competitor = population[Math.floor(Math.random() * population.length)];
+		if (competitor.fitness > best.fitness) {
+			best = competitor;
+		}
+	}
+	return best;
+}
+
+function crossover(parent1: Genome, parent2: Genome): Genome {
+	const child = cloneGenome(parent1);
+	
+	// Uniform crossover
+	for (let layer = 1; layer < child.weights.length; layer++) {
+		const w1 = parent1.weights[layer];
+		const w2 = parent2.weights[layer];
+		const b1 = parent1.biases[layer];
+		const b2 = parent2.biases[layer];
+		const wChild = child.weights[layer];
+		const bChild = child.biases[layer];
+		
+		for (let i = 0; i < wChild.length; i++) {
+			wChild[i] = Math.random() < 0.5 ? w1[i] : w2[i];
+		}
+		for (let i = 0; i < bChild.length; i++) {
+			bChild[i] = Math.random() < 0.5 ? b1[i] : b2[i];
+		}
+	}
+	
+	return child;
+}
+
+function mutate(genome: Genome, mutationRate: number, mutationStrength: number) {
+	for (let layer = 1; layer < genome.weights.length; layer++) {
+		const w = genome.weights[layer];
+		const b = genome.biases[layer];
+		
+		for (let i = 0; i < w.length; i++) {
+			if (Math.random() < mutationRate) {
+				w[i] += (Math.random() * 2 - 1) * mutationStrength;
+			}
+		}
+		for (let i = 0; i < b.length; i++) {
+			if (Math.random() < mutationRate) {
+				b[i] += (Math.random() * 2 - 1) * mutationStrength;
+			}
+		}
+	}
 }
 
 start();
