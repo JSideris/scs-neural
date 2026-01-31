@@ -1,6 +1,7 @@
 import { ComputeShader, Shader, StorageBuffer, UniformBuffer } from "simple-compute-shaders";
 
 import lossWgsl from "./shaders/loss.compute.wgsl?raw";
+import forwardPassWgsl from "./shaders/forward-pass.compute.wgsl?raw";
 import errorPropagationWgsl from "./shaders/error-propagation.compute.wgsl?raw";
 import weightGradientComputationWgsl from "./shaders/weight-gradient-computation.compute.wgsl?raw";
 import biasGradientComputationWgsl from "./shaders/bias-gradient-computation.compute.wgsl?raw";
@@ -319,7 +320,7 @@ export default class NeuralNetwork {
     this.forwardPassShader = new ComputeShader({
       useExecutionCountBuffer: false,
       useTimeBuffer: false,
-      code: forwardPassGeneticWgsl,
+      code: forwardPassWgsl,
       workgroupCount: [Math.ceil(maxLayerSize / 64), 1],
       bindingLayouts: [
         {
