@@ -20,7 +20,26 @@ async function start() {
 		testingBatchSize: 1,
 		outputActivationType: ActivationType.LINEAR,
 	});
-	await neuralNetwork.initialize("xavier");
+	
+	try {
+		await neuralNetwork.initialize("xavier");
+	} catch (error) {
+		console.error("WebGPU Initialization Failed:", error);
+		const errorDiv = document.createElement("div");
+		errorDiv.style.color = "red";
+		errorDiv.style.padding = "20px";
+		errorDiv.style.background = "#fff";
+		errorDiv.style.border = "1px solid red";
+		errorDiv.style.margin = "20px";
+		errorDiv.innerHTML = `
+			<h2>WebGPU Initialization Failed</h2>
+			<p>${error.message}</p>
+			<p>Your browser or system might not support WebGPU, or hardware acceleration is disabled.</p>
+			<p>Try launching Chrome with: <code>--ignore-gpu-blocklist --enable-unsafe-webgpu</code></p>
+		`;
+		document.body.prepend(errorDiv);
+		return;
+	}
 
 	// Initialize population
 	let population: Genome[] = [];
