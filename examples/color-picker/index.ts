@@ -1,6 +1,6 @@
-import NeuralNetwork, { ActivationType } from "./neural-network";
+import { NeuralNetwork, ActivationType } from "../../src";
 import setupTestingUI from "./test-ui";
-import TrainingVisualizer from "./ui";
+import TrainingVisualizer from "../shared/ui";
 
 async function start() {
 	const trainingBatchSize = 10;

@@ -22,7 +22,7 @@ This library does not use standard tensor libraries. Instead:
 ## 📦 Installation
 
 ```bash
-npm install
+npm install scs-neural
 ```
 
 ## 📖 Usage
@@ -32,7 +32,7 @@ npm install
 Define your network architecture and initialize it with WebGPU.
 
 ```typescript
-import NeuralNetwork, { ActivationType } from "./src/neural-network";
+import { NeuralNetwork, ActivationType } from "scs-neural";
 
 const nn = new NeuralNetwork({
     layerSizes: [3, 12, 12, 3], // Input, Hidden Layers, Output
@@ -80,24 +80,35 @@ await nn.train({
 const { activations, losses } = await nn.evaluatePopulation({
     populationSize: 100,
     batchSize: 1,
-    weights: populationWeights, // [layer][genomeIndex]
-    biases: populationBiases,   // [layer][genomeIndex]
+    weights: populationWeights, // [layerIndex][genomeIndex]
+    biases: populationBiases,   // [layerIndex][genomeIndex]
     inputs: populationInputs,   // [genomeIndex]
     returnActivations: true,
     returnLoss: false
 });
 ```
 
+## 🧪 Examples
+
+This repository contains several examples showcasing the library:
+
+- **Flappy Bird Genetic Algorithm**: Training birds to play Flappy Bird using parallel genetic evaluation.
+- **Color Inversion**: Standard supervised training to invert RGB colors.
+
+To run the examples locally:
+
+```bash
+npm install
+npm run dev
+```
+
+Then open the URL provided by Vite.
+
 ## 🏗 Architecture
 
-The library is organized around the `NeuralNetwork` class in `[src/neural-network.ts](src/neural-network.ts)`.
+The core library is located in `src/`.
 
-- **Shaders**: Located in `src/shaders/`, these WGSL files handle the core mathematical operations:
-  - `forward-pass.compute.wgsl`: Standard dense layer inference.
-  - `forward-pass-genetic.compute.wgsl`: Optimized parallel population inference.
-  - `error-propagation.compute.wgsl`: Computes error gradients for backpropagation.
-  - `weight-gradient-computation.compute.wgsl` & `bias-gradient-computation.compute.wgsl`: Compute parameter gradients.
-  - `update-parameters.compute.wgsl`: Applies gradients to weights and biases.
+- **Shaders**: Located in `src/shaders/`, these WGSL files handle the core mathematical operations.
 - **Buffer Management**: The library maintains dedicated `StorageBuffer` objects for weights, biases, gradients, and activations for every layer to avoid runtime allocations and garbage collection overhead.
 
 ## 📄 License

@@ -1,4 +1,4 @@
-import type NeuralNetwork from "./neural-network";
+import { NeuralNetwork } from "../../src";
 
 export default function setupTestingUI(neuralNetwork: NeuralNetwork) {
 	// Add global styles

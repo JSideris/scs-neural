@@ -1,13 +1,17 @@
 {
-	"compilerOptions": {
-	  "target": "ES6",
-	  "module": "ESNext",
-	  "moduleResolution": "node",
-	  "lib": ["dom", "es6"],
-	  "esModuleInterop": true,
-	  "skipLibCheck": true,
-	  "outDir": "./dist"
-	},
-	"include": ["src"]
-  }
-  
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["DOM", "DOM.Iterable", "ESNext"],
+    "types": ["@webgpu/types", "vite/client"],
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "isolatedModules": true,
+    "resolveJsonModule": true,
+    "noEmit": true,
+    "outDir": "./dist"
+  },
+  "include": ["src", "examples", "vite.config.ts"]
+}
