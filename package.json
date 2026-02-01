@@ -41,13 +41,21 @@
     "prepublishOnly": "npm run build"
   },
   "devDependencies": {
+    "@types/react": "^19.2.10",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.1.2",
     "@webgpu/types": "^0.1.51",
+    "chart.js": "^4.5.0",
     "typescript": "^5.9.2",
     "vite": "^6.2.1",
-    "vite-plugin-dts": "^4.5.4",
-    "chart.js": "^4.5.0"
+    "vite-plugin-dts": "^4.5.4"
   },
   "dependencies": {
+    "lucide-react": "^0.563.0",
+    "react": "^19.2.4",
+    "react-chartjs-2": "^5.3.1",
+    "react-dom": "^19.2.4",
+    "react-router-dom": "^7.13.0",
     "simple-compute-shaders": "^0.3.0"
   }
 }

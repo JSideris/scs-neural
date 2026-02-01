@@ -687,7 +687,7 @@ export default class NeuralNetwork {
   }
 
   private getPingPongCopyLayout() {
-    return {
+    const layout: any = {
       group0: [
         { binding: this.errorGradientsABuffer, name: "input_data", type: "storage" },
         { binding: this.errorGradientsBBuffer, name: "output_data", type: "storage" },
@@ -697,6 +697,26 @@ export default class NeuralNetwork {
         { binding: this.errorGradientsABuffer, name: "output_data", type: "storage" },
       ],
     };
+
+    // Add activation copy layouts
+    this.trainingDataBuffers.forEach((_, i) => {
+      if (i > 0) {
+        layout[`training_layer_${i}`] = [
+          { binding: this.trainingDataBuffers[i - 1].trainingActivations, name: "input_data", type: "storage" },
+          { binding: this.trainingDataBuffers[i].trainingActivations, name: "output_data", type: "storage" },
+        ];
+        layout[`test_layer_0`] = [
+          { binding: this.testActivationsBufferA, name: "input_data", type: "storage" },
+          { binding: this.testActivationsBufferB, name: "output_data", type: "storage" },
+        ];
+        layout[`test_layer_1`] = [
+          { binding: this.testActivationsBufferB, name: "input_data", type: "storage" },
+          { binding: this.testActivationsBufferA, name: "output_data", type: "storage" },
+        ];
+      }
+    });
+
+    return layout;
   }
 
   private getPrepareDeltaDataLayout() {
@@ -782,12 +802,29 @@ export default class NeuralNetwork {
   }
 
   private getMaxPoolDataLayout() {
-    const layout: any = {};
+    const layout: any = {
+      test_layer_0: [
+        { binding: this.testActivationsBufferA, name: "inputs", type: "storage" },
+        { binding: this.testActivationsBufferB, name: "activations", type: "storage" },
+        { binding: this.layerBuffers.find(l => l.maxIndices !== null)?.maxIndices!, name: "max_indices", type: "storage" }, // Placeholder, fixed below
+      ],
+      test_layer_1: [
+        { binding: this.testActivationsBufferB, name: "inputs", type: "storage" },
+        { binding: this.testActivationsBufferA, name: "activations", type: "storage" },
+        { binding: this.layerBuffers.find(l => l.maxIndices !== null)?.maxIndices!, name: "max_indices", type: "storage" }, // Placeholder, fixed below
+      ],
+    };
     this.trainingDataBuffers.forEach((_, i) => {
       if (i > 0 && this.layers[i].type === LayerType.MAXPOOL2D) {
         layout[`layer_${i}`] = [
           { binding: this.trainingDataBuffers[i - 1].trainingActivations, name: "inputs", type: "storage" },
           { binding: this.trainingDataBuffers[i].trainingActivations, name: "activations", type: "storage" },
+          { binding: this.layerBuffers[i].maxIndices!, name: "max_indices", type: "storage" },
+        ];
+        // Add test layouts for specific layers
+        layout[`test_layer_${(i + 1) % 2}_layer_${i}`] = [
+          { binding: (i + 1) % 2 === 1 ? this.testActivationsBufferB : this.testActivationsBufferA, name: "inputs", type: "storage" },
+          { binding: (i + 1) % 2 === 1 ? this.testActivationsBufferA : this.testActivationsBufferB, name: "activations", type: "storage" },
           { binding: this.layerBuffers[i].maxIndices!, name: "max_indices", type: "storage" },
         ];
       }
@@ -990,13 +1027,25 @@ export default class NeuralNetwork {
           ];
 
           this.maxpool2dForwardShader.dispatch({
-            bindGroups: { 1: `layer_${i}` }, // Uses custom layout for MaxPool
+            bindGroups: { 1: trainMode ? `layer_${i}` : `test_layer_${(i + 1) % 2}_layer_${i}` },
           });
         }
       } else if (layer.type === LayerType.FLATTEN) {
-        // Flatten is logical. Next layer's forward pass will correctly 
-        // reference this layer's output because of how getLayerDataLayout is structured.
-        // No action needed here unless we want to copy for some reason.
+        const size = batchSize * layer.size;
+        this.copyParamsBuffer.write(new Uint32Array([size]));
+        this.copyShader.props.workgroupCount = [Math.ceil(size / 64), 1, 1];
+        
+        const inputBuffer = trainMode ? this.trainingDataBuffers[i - 1].trainingActivations : [this.testActivationsBufferA, this.testActivationsBufferB][i % 2];
+        const outputBuffer = trainMode ? this.trainingDataBuffers[i].trainingActivations : [this.testActivationsBufferB, this.testActivationsBufferA][i % 2];
+
+        // We need a layout for arbitrary buffer copies or use existing ones
+        // The copyShader has getPingPongCopyLayout which uses errorGradientsABuffer/BBuffer.
+        // We should add a layout for activation copies.
+        this.copyShader.dispatch({
+          bindGroups: {
+            1: trainMode ? `training_layer_${i}` : `test_layer_${(i + 1) % 2}`
+          }
+        });
       }
 
       // Handle Softmax if it's the output layer

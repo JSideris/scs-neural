@@ -54,11 +54,10 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             }
         }
 
-        let normalization = f32(params.output_height * params.output_width);
         if (grad_params.accumulate == 0u) {
-            weight_gradients[weight_idx] = grad / normalization;
+            weight_gradients[weight_idx] = grad;
         } else {
-            weight_gradients[weight_idx] += grad / normalization;
+            weight_gradients[weight_idx] += grad;
         }
     }
 
@@ -77,11 +76,10 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             }
         }
 
-        let normalization = f32(params.output_height * params.output_width);
         if (grad_params.accumulate == 0u) {
-            bias_gradients[out_c] = b_grad / normalization;
+            bias_gradients[out_c] = b_grad;
         } else {
-            bias_gradients[out_c] += b_grad / normalization;
+            bias_gradients[out_c] += b_grad;
         }
     }
 }

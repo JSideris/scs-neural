@@ -1,4 +1,5 @@
 import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
 import dts from 'vite-plugin-dts';
 import { resolve } from 'path';
 
@@ -7,6 +8,7 @@ export default defineConfig(({ mode }) => {
 
   return {
     plugins: [
+      react(),
       isLib && dts({
         include: ['src'],
         insertTypesEntry: true,
@@ -20,11 +22,13 @@ export default defineConfig(({ mode }) => {
         formats: ['es', 'umd'],
       },
       rollupOptions: {
-        external: ['simple-compute-shaders', 'chart.js'],
+        external: ['simple-compute-shaders', 'chart.js', 'react', 'react-dom'],
         output: {
           globals: {
             'simple-compute-shaders': 'SimpleComputeShaders',
             'chart.js': 'Chart',
+            'react': 'React',
+            'react-dom': 'ReactDOM',
           },
         },
       },
@@ -33,9 +37,6 @@ export default defineConfig(({ mode }) => {
       rollupOptions: {
         input: {
           main: resolve(__dirname, 'index.html'),
-          flappy: resolve(__dirname, 'examples/flappy-bird/index.html'),
-          color: resolve(__dirname, 'examples/color-picker/index.html'),
-          shape: resolve(__dirname, 'examples/shape-classifier/index.html'),
         },
       },
       outDir: 'dist-examples',
