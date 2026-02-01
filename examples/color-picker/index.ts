@@ -1,4 +1,4 @@
-import { NeuralNetwork, ActivationType } from "../../src";
+import { NeuralNetwork, ActivationType, LayerType } from "../../src";
 import setupTestingUI from "./test-ui";
 import TrainingVisualizer from "../shared/ui";
 
@@ -6,7 +6,12 @@ async function start() {
 	const trainingBatchSize = 10;
 
 	const neuralNetwork = new NeuralNetwork({
-		layerSizes: [3, 12, 12, 3],
+		layers: [
+			{ type: LayerType.INPUT, shape: [3] },
+			{ type: LayerType.DENSE, size: 12 },
+			{ type: LayerType.DENSE, size: 12 },
+			{ type: LayerType.DENSE, size: 3 },
+		],
 		trainingBatchSize: trainingBatchSize,
 		testingBatchSize: 1,
 		outputActivationType: ActivationType.LINEAR,
@@ -56,14 +61,6 @@ async function start() {
 		targetActivations.push(...batchTargets);
 	}
 
-	// // Add these after generating random examples
-
-
-	// edgeCases.forEach(({ input, target }) => {
-	// 	inputActivations.push(new Float32Array(input));
-	// 	targetActivations.push(new Float32Array(target));
-	// });
-
 	// Initialize the visualizer
 	const visualizer = new TrainingVisualizer({
 		title: 'Neural Network Training Progress',
@@ -75,10 +72,7 @@ async function start() {
 		inputActivations,
 		targetActivations,
 		epochs: 1000,
-		// batchSize: trainingBatchSize,
 		learningRate: 0.01,
-		momentum: 0.9,
-		weightDecay: 0.01,
 		progressCallback: (epoch, loss) => {
 			visualizer.update(epoch, loss);
 		}
@@ -93,8 +87,9 @@ async function start() {
 
 	// ADD THIS:
 console.log('=== INSPECTING LEARNED PARAMETERS ===');
-const weightsData = await neuralNetwork.layerBuffers[1].weights.read();
-const biasesData = await neuralNetwork.layerBuffers[1].biases.read();
+// Note: layerBuffers now have weights at index 1, 2, 3 (Input is index 0)
+const weightsData = await neuralNetwork.layerBuffers[1].weights!.read();
+const biasesData = await neuralNetwork.layerBuffers[1].biases!.read();
 
 console.log('Weights (should be close to -1 on diagonal, 0 elsewhere):');
 for(let out = 0; out < 3; out++) {

@@ -35,6 +35,7 @@ export default defineConfig(({ mode }) => {
           main: resolve(__dirname, 'index.html'),
           flappy: resolve(__dirname, 'examples/flappy-bird/index.html'),
           color: resolve(__dirname, 'examples/color-picker/index.html'),
+          shape: resolve(__dirname, 'examples/shape-classifier/index.html'),
         },
       },
       outDir: 'dist-examples',

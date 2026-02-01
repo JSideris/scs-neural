@@ -8,30 +8,83 @@ import biasGradientComputationWgsl from "./shaders/bias-gradient-computation.com
 import updateParametersWgsl from "./shaders/update-parameters.compute.wgsl?raw";
 import forwardPassGeneticWgsl from "./shaders/forward-pass-genetic.compute.wgsl?raw";
 import lossGeneticWgsl from "./shaders/loss-genetic.compute.wgsl?raw";
+import conv2dForwardWgsl from "./shaders/conv2d-forward.compute.wgsl?raw";
+import conv2dBackwardDataWgsl from "./shaders/conv2d-backward-data.compute.wgsl?raw";
+import conv2dBackwardWeightsWgsl from "./shaders/conv2d-backward-weights.compute.wgsl?raw";
+import maxpool2dForwardWgsl from "./shaders/maxpool2d-forward.compute.wgsl?raw";
+import maxpool2dBackwardWgsl from "./shaders/maxpool2d-backward.compute.wgsl?raw";
+import softmaxWgsl from "./shaders/softmax.compute.wgsl?raw";
+import copyWgsl from "./shaders/copy.compute.wgsl?raw";
+import prepareDeltaWgsl from "./shaders/prepare-delta.compute.wgsl?raw";
+
 import InitializationMethods from "./initialization-methods";
-import { ActivationType, NeuralNetworkOptions, TrainOptions, EvaluatePopulationOptions } from "./types";
+import {
+  ActivationType,
+  NeuralNetworkOptions,
+  TrainOptions,
+  EvaluatePopulationOptions,
+  LayerConfig,
+  LayerType,
+} from "./types";
 
 // Allows loss to be stored in a u32 rather than a f32, which is required by WGSL for atomic operations.
 const LOSS_MULTIPLIER = 10000;
 
+interface LayerMetadata {
+  type: LayerType;
+  shape: number[];
+  size: number;
+  config: LayerConfig;
+}
+
 export default class NeuralNetwork {
   private forwardPassShader!: ComputeShader;
+  private conv2dForwardShader!: ComputeShader;
+  private maxpool2dForwardShader!: ComputeShader;
+  private forwardGeneticShader!: ComputeShader;
+
+  private lossShader!: ComputeShader;
+  private backwardErrorShader!: ComputeShader;
+  private conv2dBackwardDataShader!: ComputeShader;
+  private maxpool2dBackwardShader!: ComputeShader;
+
+  private weightGradientComputationShader!: ComputeShader;
+  private biasGradientComputationShader!: ComputeShader;
+  private conv2dBackwardWeightsShader!: ComputeShader;
+  private updateParametersShader!: ComputeShader;
+  private softmaxShader!: ComputeShader;
+  private copyShader!: ComputeShader;
+  private prepareDeltaShader!: ComputeShader;
 
   private forwardPassParamsBuffer!: StorageBuffer;
+  private forwardGeneticParamsBuffer!: StorageBuffer;
   private lossParamsBuffer!: StorageBuffer;
   private backwardPassParamsBuffer!: StorageBuffer;
+  private prepareDeltaParamsBuffer!: StorageBuffer;
   private gradientParamsBuffer!: StorageBuffer;
   private learningRateBuffer!: UniformBuffer;
 
+  private conv2dParamsBuffer!: StorageBuffer;
+  private maxpool2dParamsBuffer!: StorageBuffer;
+  private softmaxParamsBuffer!: StorageBuffer;
+  private copyParamsBuffer!: StorageBuffer;
+
+  private geneticWeightsBuffers: StorageBuffer[] = [];
+  private geneticBiasesBuffers: StorageBuffer[] = [];
+  private geneticActivationsBuffers: StorageBuffer[] = [];
+  private currentGeneticPopulationSize: number = 0;
+  private currentGeneticBatchSize: number = 0;
+
   layerBuffers: {
     // Network:
-    weights: StorageBuffer;
-    biases: StorageBuffer;
+    weights: StorageBuffer | null;
+    biases: StorageBuffer | null;
 
     // Training:
     errors: StorageBuffer;
-    weightGradients: StorageBuffer;
-    biasGradients: StorageBuffer;
+    weightGradients: StorageBuffer | null;
+    biasGradients: StorageBuffer | null;
+    maxIndices: StorageBuffer | null; // For MaxPool
   }[] = [];
 
   private trainingDataBuffers: {
@@ -50,40 +103,97 @@ export default class NeuralNetwork {
   private errorGradientsBBuffer!: StorageBuffer;
 
   private isInitialized: boolean = false;
-  layerSizes: number[];
+  layers: LayerMetadata[] = [];
   private trainingBatchSize: number;
   private testingBatchSize: number;
-
-  private lossShader!: ComputeShader;
-  private backwardErrorShader!: ComputeShader;
-  private weightGradientComputationShader!: ComputeShader;
-  private biasGradientComputationShader!: ComputeShader;
-  private updateParametersShader!: ComputeShader;
 
   private hiddenActivationType: ActivationType;
   private outputActivationType: ActivationType;
 
   get outputSize() {
-    return this.layerSizes?.length ? this.layerSizes[this.layerSizes.length - 1] : 0;
+    return this.layers.length ? this.layers[this.layers.length - 1].size : 0;
   }
 
   get inputSize() {
-    return this.layerSizes?.length ? this.layerSizes[0] : 0;
+    return this.layers.length ? this.layers[0].size : 0;
   }
 
   constructor(props: NeuralNetworkOptions) {
-    if (!props.layerSizes || props.layerSizes.length < 2) {
-      throw new Error("Layer sizes must be an array of at least 2 numbers.");
-    }
-    if (props.layerSizes.some((size) => size < 1)) {
-      throw new Error("Layer sizes must be greater than 0.");
-    }
-
-    this.layerSizes = props.layerSizes;
     this.testingBatchSize = props.testingBatchSize ?? 1;
     this.trainingBatchSize = props.trainingBatchSize ?? 1;
     this.hiddenActivationType = props.hiddenActivationType ?? ActivationType.RELU;
     this.outputActivationType = props.outputActivationType ?? ActivationType.RELU;
+
+    if (props.layers) {
+      this.parseLayers(props.layers);
+    } else if (props.layerSizes) {
+      // Backward compatibility
+      const layers: LayerConfig[] = props.layerSizes.map((size, i) => {
+        if (i === 0) return { type: LayerType.INPUT, shape: [size] };
+        return { type: LayerType.DENSE, size };
+      });
+      this.parseLayers(layers);
+    } else {
+      throw new Error("Either layers or layerSizes must be provided.");
+    }
+  }
+
+  private parseLayers(configs: LayerConfig[]) {
+    if (configs.length < 2) {
+      throw new Error("Network must have at least an input and one more layer.");
+    }
+    if (configs[0].type !== LayerType.INPUT) {
+      throw new Error("First layer must be an input layer.");
+    }
+
+    let currentShape = configs[0].shape;
+    this.layers.push({
+      type: LayerType.INPUT,
+      shape: currentShape,
+      size: currentShape.reduce((a, b) => a * b, 1),
+      config: configs[0],
+    });
+
+    for (let i = 1; i < configs.length; i++) {
+      const config = configs[i];
+      let nextShape: number[] = [];
+
+      switch (config.type) {
+        case LayerType.DENSE:
+          nextShape = [config.size];
+          break;
+        case LayerType.CONV2D: {
+          const [h, w, c] = currentShape.length === 3 ? currentShape : [1, currentShape[0], 1];
+          const stride = config.stride ?? 1;
+          const padding = config.padding ?? 0;
+          const outH = Math.floor((h + 2 * padding - config.kernelSize) / stride) + 1;
+          const outW = Math.floor((w + 2 * padding - config.kernelSize) / stride) + 1;
+          nextShape = [outH, outW, config.filters];
+          break;
+        }
+        case LayerType.MAXPOOL2D: {
+          const [h, w, c] = currentShape;
+          const stride = config.stride ?? config.poolSize;
+          const outH = Math.floor((h - config.poolSize) / stride) + 1;
+          const outW = Math.floor((w - config.poolSize) / stride) + 1;
+          nextShape = [outH, outW, c];
+          break;
+        }
+        case LayerType.FLATTEN:
+          nextShape = [currentShape.reduce((a, b) => a * b, 1)];
+          break;
+        default:
+          throw new Error(`Unknown layer type: ${(config as any).type}`);
+      }
+
+      this.layers.push({
+        type: config.type,
+        shape: nextShape,
+        size: nextShape.reduce((a, b) => a * b, 1),
+        config,
+      });
+      currentShape = nextShape;
+    }
   }
 
   async initialize(initializationMethod: "uniform" | "xavier" | "he" | "zero" = "xavier") {
@@ -94,135 +204,145 @@ export default class NeuralNetwork {
 
     await Shader.initialize();
 
-    let maxLayerSize = Math.max(...this.layerSizes);
+    const maxLayerSize = Math.max(...this.layers.map((l) => l.size));
 
-    {
-      // Create all the temp buffers.
+    // Create ping-pong buffers for testing
+    this.testActivationsBufferA = new StorageBuffer({
+      dataType: "array<f32>",
+      size: this.testingBatchSize * maxLayerSize,
+      canCopyDst: true,
+      canCopySrc: true,
+    });
+    this.testActivationsBufferB = new StorageBuffer({
+      dataType: "array<f32>",
+      size: this.testingBatchSize * maxLayerSize,
+      canCopyDst: true,
+      canCopySrc: true,
+    });
+    this.testZValuesBuffer = new StorageBuffer({
+      dataType: "array<f32>",
+      size: this.testingBatchSize * maxLayerSize,
+    });
 
-      this.testActivationsBufferA = new StorageBuffer({
-        dataType: "array<f32>",
-        size: this.testingBatchSize * maxLayerSize,
-        canCopyDst: true,
-        canCopySrc: this.layerSizes.length % 2 == 1 ? true : false,
-      });
-      this.testActivationsBufferB = new StorageBuffer({
-        dataType: "array<f32>",
-        size: this.testingBatchSize * maxLayerSize,
-        canCopyDst: false,
-        canCopySrc: this.layerSizes.length % 2 == 0 ? true : false,
-      });
-      this.testZValuesBuffer = new StorageBuffer({
-        dataType: "array<f32>",
-        size: this.testingBatchSize * maxLayerSize,
-      });
+    for (let i = 0; i < this.layers.length; i++) {
+      const layer = this.layers[i];
+      let weightBuffer: StorageBuffer | null = null;
+      let biasBuffer: StorageBuffer | null = null;
+      let weightGradBuffer: StorageBuffer | null = null;
+      let biasGradBuffer: StorageBuffer | null = null;
+      let maxIndicesBuffer: StorageBuffer | null = null;
 
-      for (let layer = 0; layer < this.layerSizes.length; layer++) {
-        let weightData: Float32Array | undefined;
-        let biasData: Float32Array | undefined;
+      if (i > 0) {
+        const prevLayer = this.layers[i - 1];
+        if (layer.type === LayerType.DENSE) {
+          const fanIn = prevLayer.size;
+          const fanOut = layer.size;
+          const totalWeights = fanIn * fanOut;
+          const weightData = this.getInitData(initializationMethod, fanIn, fanOut, totalWeights);
+          const biasData = this.getInitData(initializationMethod === "zero" ? "zero" : "uniform", 1, fanOut, fanOut);
 
-        if (layer > 0) {
-          let inputSize = this.layerSizes[layer - 1];
-          let outputSize = this.layerSizes[layer];
-
-          switch (initializationMethod) {
-            case "xavier":
-              weightData = InitializationMethods.initXavier(inputSize, outputSize);
-              break;
-
-            case "he":
-              weightData = InitializationMethods.initHe(inputSize, outputSize);
-              break;
-
-            case "uniform":
-              weightData = InitializationMethods.initUniform(inputSize, outputSize, -0.5, 0.5);
-              break;
-
-            case "zero":
-              weightData = InitializationMethods.initZero(inputSize, outputSize);
-              break;
-
-            default:
-              throw new Error(`Unknown initialization method: ${initializationMethod}`);
-          }
-
-          biasData = initializationMethod === "zero"
-            ? InitializationMethods.initZero(1, outputSize)
-            : InitializationMethods.initUniform(1, outputSize, -0.1, 0.1);
-        }
-
-        this.layerBuffers.push({
-          weights:
-            layer > 0
-              ? new StorageBuffer({
-                  dataType: "array<f32>",
-                  size: this.layerSizes[layer - 1] * this.layerSizes[layer],
-                  initialValue: weightData,
-                  canCopyDst: true,
-                  canCopySrc: true,
-                })
-              : (null as any),
-          biases:
-            layer > 0
-              ? new StorageBuffer({
-                  dataType: "array<f32>",
-                  size: this.layerSizes[layer],
-                  initialValue: biasData,
-                  canCopyDst: true,
-                  canCopySrc: true,
-                })
-              : (null as any),
-          errors:
-            layer > 0
-              ? new StorageBuffer({
-                  dataType: "array<f32>",
-                  size: this.trainingBatchSize * this.layerSizes[layer],
-                })
-              : (null as any),
-          weightGradients:
-            layer > 0
-              ? new StorageBuffer({
-                  dataType: "array<f32>",
-                  size: this.layerSizes[layer - 1] * this.layerSizes[layer],
-                })
-              : (null as any),
-          biasGradients:
-            layer > 0
-              ? new StorageBuffer({
-                  dataType: "array<f32>",
-                  size: this.layerSizes[layer],
-                })
-              : (null as any),
-        });
-
-        this.trainingDataBuffers.push({
-          trainingActivations: new StorageBuffer({
+          weightBuffer = new StorageBuffer({
             dataType: "array<f32>",
-            size: this.trainingBatchSize * this.layerSizes[layer],
-            canCopyDst: layer == 0 ? true : false,
-            canCopySrc: layer == this.layerSizes.length - 1 ? true : false,
-          }),
-          trainingZValues:
-            layer > 0
-              ? new StorageBuffer({
-                  dataType: "array<f32>",
-                  size: this.trainingBatchSize * this.layerSizes[layer],
-                })
-              : null,
-        });
+            size: totalWeights,
+            initialValue: weightData,
+            canCopyDst: true,
+            canCopySrc: true,
+          });
+          biasBuffer = new StorageBuffer({
+            dataType: "array<f32>",
+            size: fanOut,
+            initialValue: biasData,
+            canCopyDst: true,
+            canCopySrc: true,
+          });
+          weightGradBuffer = new StorageBuffer({ dataType: "array<f32>", size: totalWeights });
+          biasGradBuffer = new StorageBuffer({ dataType: "array<f32>", size: fanOut });
+        } else if (layer.type === LayerType.CONV2D) {
+          const config = layer.config as any;
+          const inChannels = prevLayer.shape[2];
+          const fanIn = config.kernelSize * config.kernelSize * inChannels;
+          const fanOut = config.filters;
+          const totalWeights = fanIn * fanOut;
+          const weightData = this.getInitData(initializationMethod, fanIn, fanOut, totalWeights);
+          const biasData = this.getInitData(initializationMethod === "zero" ? "zero" : "uniform", 1, fanOut, fanOut);
+
+          weightBuffer = new StorageBuffer({
+            dataType: "array<f32>",
+            size: totalWeights,
+            initialValue: weightData,
+            canCopyDst: true,
+            canCopySrc: true,
+          });
+          biasBuffer = new StorageBuffer({
+            dataType: "array<f32>",
+            size: fanOut,
+            initialValue: biasData,
+            canCopyDst: true,
+            canCopySrc: true,
+          });
+          weightGradBuffer = new StorageBuffer({ dataType: "array<f32>", size: totalWeights });
+          biasGradBuffer = new StorageBuffer({ dataType: "array<f32>", size: fanOut });
+        } else if (layer.type === LayerType.MAXPOOL2D) {
+          maxIndicesBuffer = new StorageBuffer({
+            dataType: "array<u32>",
+            size: this.trainingBatchSize * layer.size,
+          });
+        }
       }
+
+      this.layerBuffers.push({
+        weights: weightBuffer,
+        biases: biasBuffer,
+        errors: new StorageBuffer({
+          dataType: "array<f32>",
+          size: this.trainingBatchSize * layer.size,
+        }),
+        weightGradients: weightGradBuffer,
+        biasGradients: biasGradBuffer,
+        maxIndices: maxIndicesBuffer,
+      });
+
+      this.trainingDataBuffers.push({
+        trainingActivations: new StorageBuffer({
+          dataType: "array<f32>",
+          size: this.trainingBatchSize * layer.size,
+          canCopyDst: i === 0,
+          canCopySrc: i === this.layers.length - 1,
+        }),
+        trainingZValues: i > 0 ? new StorageBuffer({
+          dataType: "array<f32>",
+          size: this.trainingBatchSize * layer.size,
+        }) : null,
+      });
     }
 
-    // Create ping-pong buffers for error propagation
+    // Ping-pong for backprop errors
     this.errorGradientsABuffer = new StorageBuffer({
       dataType: "array<f32>",
       size: this.trainingBatchSize * maxLayerSize,
     });
-
     this.errorGradientsBBuffer = new StorageBuffer({
       dataType: "array<f32>",
       size: this.trainingBatchSize * maxLayerSize,
     });
 
+    this.initParamsBuffers();
+    this.initShaders(maxLayerSize);
+
+    this.isInitialized = true;
+  }
+
+  private getInitData(method: string, fanIn: number, fanOut: number, totalSize: number) {
+    switch (method) {
+      case "xavier": return InitializationMethods.initXavier(fanIn, fanOut, totalSize);
+      case "he": return InitializationMethods.initHe(fanIn, fanOut, totalSize);
+      case "uniform": return InitializationMethods.initUniform(totalSize, -0.1, 0.1);
+      case "zero": return InitializationMethods.initZero(totalSize);
+      default: throw new Error(`Unknown initialization method: ${method}`);
+    }
+  }
+
+  private initParamsBuffers() {
     this.forwardPassParamsBuffer = new StorageBuffer({
       dataType: "struct",
       structName: "LayerParams",
@@ -235,34 +355,82 @@ export default class NeuralNetwork {
       canCopyDst: true,
     });
 
+    this.forwardGeneticParamsBuffer = new StorageBuffer({
+      dataType: "struct",
+      structName: "GeneticLayerParams",
+      fields: [
+        { name: "population_size", dataType: "u32" },
+        { name: "batch_size", dataType: "u32" },
+        { name: "input_size", dataType: "u32" },
+        { name: "output_size", dataType: "u32" },
+        { name: "activation_type", dataType: "u32" },
+      ],
+      canCopyDst: true,
+    });
+
+    this.conv2dParamsBuffer = new StorageBuffer({
+      dataType: "struct",
+      structName: "Conv2DParams",
+      fields: [
+        { name: "batch_size", dataType: "u32" },
+        { name: "input_height", dataType: "u32" },
+        { name: "input_width", dataType: "u32" },
+        { name: "input_channels", dataType: "u32" },
+        { name: "output_height", dataType: "u32" },
+        { name: "output_width", dataType: "u32" },
+        { name: "output_channels", dataType: "u32" },
+        { name: "kernel_size", dataType: "u32" },
+        { name: "stride", dataType: "u32" },
+        { name: "padding", dataType: "u32" },
+        { name: "activation_type", dataType: "u32" },
+      ],
+      canCopyDst: true,
+    });
+
+    this.maxpool2dParamsBuffer = new StorageBuffer({
+      dataType: "struct",
+      structName: "PoolParams",
+      fields: [
+        { name: "batch_size", dataType: "u32" },
+        { name: "input_height", dataType: "u32" },
+        { name: "input_width", dataType: "u32" },
+        { name: "channels", dataType: "u32" },
+        { name: "output_height", dataType: "u32" },
+        { name: "output_width", dataType: "u32" },
+        { name: "pool_size", dataType: "u32" },
+        { name: "stride", dataType: "u32" },
+      ],
+      canCopyDst: true,
+    });
+
+    this.softmaxParamsBuffer = new StorageBuffer({
+      dataType: "struct",
+      structName: "SoftmaxParams",
+      fields: [
+        { name: "batch_size", dataType: "u32" },
+        { name: "output_size", dataType: "u32" },
+      ],
+      canCopyDst: true,
+    });
+
+    this.copyParamsBuffer = new StorageBuffer({
+      dataType: "struct",
+      structName: "CopyParams",
+      fields: [{ name: "size", dataType: "u32" }],
+      canCopyDst: true,
+    });
+
     this.lossParamsBuffer = new StorageBuffer({
       dataType: "struct",
       structName: "LossParams",
       fields: [
-        {
-          name: "batch_size",
-          dataType: "u32",
-        },
-        {
-          name: "output_size",
-          dataType: "u32",
-        },
-        {
-          name: "loss_type",
-          dataType: "u32",
-        },
-        {
-          name: "reduction",
-          dataType: "u32",
-        },
-        {
-          name: "loss_multiplier",
-          dataType: "u32",
-        },
+        { name: "batch_size", dataType: "u32" },
+        { name: "output_size", dataType: "u32" },
+        { name: "loss_type", dataType: "u32" },
+        { name: "reduction", dataType: "u32" },
+        { name: "loss_multiplier", dataType: "u32" },
       ],
       canCopyDst: true,
-      canCopySrc: true,
-      initialValue: [this.trainingBatchSize, this.outputSize, 0, 0],
     });
 
     this.backwardPassParamsBuffer = new StorageBuffer({
@@ -272,6 +440,16 @@ export default class NeuralNetwork {
         { name: "batch_size", dataType: "u32" },
         { name: "current_layer_size", dataType: "u32" },
         { name: "next_layer_size", dataType: "u32" },
+      ],
+      canCopyDst: true,
+    });
+
+    this.prepareDeltaParamsBuffer = new StorageBuffer({
+      dataType: "struct",
+      structName: "PrepareDeltaParams",
+      fields: [
+        { name: "batch_size", dataType: "u32" },
+        { name: "size", dataType: "u32" },
         { name: "activation_type", dataType: "u32" },
         { name: "is_output_layer", dataType: "u32" },
       ],
@@ -293,855 +471,867 @@ export default class NeuralNetwork {
     this.learningRateBuffer = new UniformBuffer({
       dataType: "f32",
       canCopyDst: true,
-      initialValue: new Float32Array([0.01]), // Default learning rate
+      initialValue: new Float32Array([0.01]),
     });
 
     this.targetsBuffer = new StorageBuffer({
       dataType: "array<f32>",
       size: this.outputSize * this.trainingBatchSize,
       canCopyDst: true,
-      canCopySrc: true,
-      initialValue: new Float32Array(this.outputSize * this.trainingBatchSize).fill(0),
     });
 
     this.totalBatchLossBuffer = new StorageBuffer({
       dataType: "array<atomic<u32>>",
       size: 1,
-      canCopyDst: true,
       canCopySrc: true,
-      initialValue: new Uint32Array(1).fill(0),
+      canCopyDst: true,
     });
+  }
 
-    // Layouts:
-    // 0: Params
-    // 1: Weights and biases
-    // 2: Inputs and activations
-    // 3: Z values
-    this.forwardPassShader = new ComputeShader({
+  private initShaders(maxLayerSize: number) {
+    const hasConv2d = this.layers.some((l) => l.type === LayerType.CONV2D);
+    const hasMaxPool2d = this.layers.some((l) => l.type === LayerType.MAXPOOL2D);
+
+    const commonShaderProps = {
       useExecutionCountBuffer: false,
       useTimeBuffer: false,
+    };
+
+    this.forwardPassShader = new ComputeShader({
+      ...commonShaderProps,
       code: forwardPassWgsl,
-      workgroupCount: [Math.ceil(maxLayerSize / 64), 1],
+      workgroupCount: [1, 1, 1],
       bindingLayouts: [
-        {
-          default: [
-            {
-              binding: this.forwardPassParamsBuffer,
-              name: "params",
-              type: "storage",
-            },
-          ],
-        },
-        this.layerBuffers.reduce((obj: any, { weights, biases }, layer) => {
-          if (layer > 0) {
-            obj[`layer_${layer}`] = [
-              {
-                binding: weights,
-                name: "weights",
-                type: "storage",
-              },
-              {
-                binding: biases,
-                name: "biases",
-                type: "storage",
-              },
-            ];
-          }
-          return obj;
-        }, {}),
-        this.trainingDataBuffers.reduce(
-          (obj: any, { trainingActivations }, layer) => {
-            if (layer > 0) {
-              obj[`training_layer_${layer}`] = [
-                {
-                  binding: this.trainingDataBuffers[layer - 1].trainingActivations,
-                  name: "inputs",
-                  type: "storage",
-                },
-                {
-                  binding: trainingActivations,
-                  name: "activations",
-                  type: "storage",
-                },
-              ];
-            }
-            return obj;
-          },
-          // Aggregator contains test ping pong buffers:
-          {
-            test_layer_0: [
-              {
-                binding: this.testActivationsBufferA,
-                name: "inputs",
-                type: "storage",
-              },
-              {
-                binding: this.testActivationsBufferB,
-                name: "activations",
-                type: "storage",
-              },
-            ],
-            test_layer_1: [
-              {
-                binding: this.testActivationsBufferB,
-                name: "inputs",
-                type: "storage",
-              },
-              {
-                binding: this.testActivationsBufferA,
-                name: "activations",
-                type: "storage",
-              },
-            ],
-          }
-        ),
-        this.trainingDataBuffers.reduce(
-          (obj: any, { trainingZValues }, layer) => {
-            if (layer > 0) {
-              obj[`training_layer_${layer}`] = [
-                {
-                  binding: trainingZValues,
-                  name: "z_values",
-                  type: "storage",
-                },
-              ];
-            }
-            return obj;
-          },
-          {
-            test_layer: [
-              {
-                binding: this.testZValuesBuffer,
-                name: "z_values",
-                type: "storage",
-              },
-            ],
-          }
-        ),
+        { default: [{ binding: this.forwardPassParamsBuffer, name: "params", type: "storage" }] },
+        this.getLayerWeightsLayout(),
+        this.getLayerDataLayout(),
+        this.getLayerZLayout(),
       ],
     });
 
+    if (hasConv2d) {
+      this.conv2dForwardShader = new ComputeShader({
+        ...commonShaderProps,
+        code: conv2dForwardWgsl,
+        workgroupCount: [1, 1, 1],
+        bindingLayouts: [
+          { default: [{ binding: this.conv2dParamsBuffer, name: "params", type: "storage" }] },
+          this.getLayerWeightsLayout(),
+          this.getLayerDataLayout(),
+          this.getLayerZLayout(),
+        ],
+      });
+    }
+
+    if (hasMaxPool2d) {
+      this.maxpool2dForwardShader = new ComputeShader({
+        ...commonShaderProps,
+        code: maxpool2dForwardWgsl,
+        workgroupCount: [1, 1, 1],
+        bindingLayouts: [
+          { default: [{ binding: this.maxpool2dParamsBuffer, name: "params", type: "storage" }] },
+          this.getMaxPoolDataLayout(),
+        ],
+      });
+    }
+
     this.lossShader = new ComputeShader({
+      ...commonShaderProps,
       code: lossWgsl,
-      workgroupCount: [Math.ceil(maxLayerSize / 64), 1],
+      workgroupCount: [1, 1, 1],
       bindingLayouts: [
         {
           default: [
+            { binding: this.lossParamsBuffer, name: "params", type: "storage" },
             {
-              binding: this.lossParamsBuffer,
-              name: "params",
-              type: "storage",
-            },
-            {
-              binding: this.trainingDataBuffers[this.trainingDataBuffers.length - 1].trainingActivations,
+              binding: this.trainingDataBuffers[this.layers.length - 1].trainingActivations,
               name: "predictions",
               type: "storage",
             },
-            {
-              binding: this.targetsBuffer,
-              name: "targets",
-              type: "storage",
-            },
-            {
-              binding: this.totalBatchLossBuffer,
-              name: "total_loss",
-              type: "storage",
-            },
+            { binding: this.targetsBuffer, name: "targets", type: "storage" },
+            { binding: this.totalBatchLossBuffer, name: "total_loss", type: "storage" },
           ],
         },
       ],
     });
 
     this.backwardErrorShader = new ComputeShader({
+      ...commonShaderProps,
       code: errorPropagationWgsl,
-      workgroupCount: [Math.ceil(maxLayerSize / 64), 1],
+      workgroupCount: [1, 1, 1],
       bindingLayouts: [
+        this.getPingPongLayout(),
+        this.getBackpropErrorDataLayout(),
         {
-          group0: [
-            {
-              binding: this.errorGradientsABuffer,
-              name: "next_layer_errors",
-              type: "storage",
-            },
-            {
-              binding: this.errorGradientsBBuffer,
-              name: "current_layer_errors",
-              type: "storage",
-            },
-          ],
-          group1: [
-            {
-              binding: this.errorGradientsBBuffer,
-              name: "next_layer_errors",
-              type: "storage",
-            },
-            {
-              binding: this.errorGradientsABuffer,
-              name: "current_layer_errors",
-              type: "storage",
-            },
-          ],
-        },
-        this.layerBuffers.reduce((obj: any, { weights }, layer) => {
-          if (layer > 0) {
-            obj[`layer${layer}`] = [
-              {
-                binding: weights,
-                name: "weights",
-                type: "storage",
-              },
-              {
-                binding: this.trainingDataBuffers[layer].trainingZValues,
-                name: "z_values",
-                type: "storage",
-              },
-            ];
-          }
-          return obj;
-        }, {}),
-        {
-          default: [
-            {
-              binding: this.backwardPassParamsBuffer,
-              name: "params",
-              type: "storage",
-            },
-            {
-              binding: this.trainingDataBuffers[this.trainingDataBuffers.length - 1].trainingActivations,
-              name: "predictions",
-              type: "storage",
-            },
-            {
-              binding: this.targetsBuffer,
-              name: "targets",
-              type: "storage",
-            },
-          ],
+          default: [{ binding: this.backwardPassParamsBuffer, name: "params", type: "storage" }],
         },
       ],
     });
 
+    if (hasConv2d) {
+      this.conv2dBackwardDataShader = new ComputeShader({
+        ...commonShaderProps,
+        code: conv2dBackwardDataWgsl,
+        workgroupCount: [1, 1, 1],
+        bindingLayouts: [
+          { default: [{ binding: this.conv2dParamsBuffer, name: "params", type: "storage" }] },
+          this.getPingPongLayout(),
+          this.getLayerWeightsLayout(),
+        ],
+      });
+    }
+
+    if (hasMaxPool2d) {
+      this.maxpool2dBackwardShader = new ComputeShader({
+        ...commonShaderProps,
+        code: maxpool2dBackwardWgsl,
+        workgroupCount: [1, 1, 1],
+        bindingLayouts: [
+          { default: [{ binding: this.maxpool2dParamsBuffer, name: "params", type: "storage" }] },
+          this.getMaxPoolBackwardDataLayout(),
+        ],
+      });
+    }
+
     this.weightGradientComputationShader = new ComputeShader({
+      ...commonShaderProps,
       code: weightGradientComputationWgsl,
-      workgroupCount: [Math.ceil(maxLayerSize / 64), 1],
-      bindingLayouts: [
-        this.layerBuffers.reduce((obj: any, {}, layer) => {
-          if (layer > 0) {
-            obj[`layer${layer}`] = [
-              {
-                binding: this.errorGradientsABuffer,
-                name: "errors",
-                type: "storage",
-              },
-              {
-                binding: this.trainingDataBuffers[layer - 1].trainingActivations,
-                name: "input_activations",
-                type: "storage",
-              },
-            ];
-            obj[`layer_alt${layer}`] = [
-              {
-                binding: this.errorGradientsBBuffer,
-                name: "errors",
-                type: "storage",
-              },
-              {
-                binding: this.trainingDataBuffers[layer - 1].trainingActivations,
-                name: "input_activations",
-                type: "storage",
-              },
-            ];
-          }
-          return obj;
-        }, {}),
-        this.layerBuffers.reduce((obj: any, { weightGradients }, layer) => {
-          if (layer > 0) {
-            obj[`layer${layer}`] = [
-              {
-                binding: this.gradientParamsBuffer,
-                name: "params",
-                type: "storage",
-              },
-              {
-                binding: weightGradients,
-                name: "weight_gradients",
-                type: "storage",
-              },
-            ];
-          }
-          return obj;
-        }, {}),
-      ],
+      workgroupCount: [1, 1, 1],
+      bindingLayouts: [this.getGradientInputLayout(), this.getGradientWeightLayout()],
     });
 
     this.biasGradientComputationShader = new ComputeShader({
+      ...commonShaderProps,
       code: biasGradientComputationWgsl,
-      workgroupCount: [maxLayerSize, 1],
-      bindingLayouts: [
-        this.layerBuffers.reduce((obj: any, {}, layer) => {
-          if (layer > 0) {
-            obj[`layer${layer}`] = [
-              {
-                binding: this.errorGradientsABuffer,
-                name: "errors",
-                type: "storage",
-              },
-              {
-                binding: this.trainingDataBuffers[layer - 1].trainingActivations,
-                name: "input_activations",
-                type: "storage",
-              },
-            ];
-            obj[`layer_alt${layer}`] = [
-              {
-                binding: this.errorGradientsBBuffer,
-                name: "errors",
-                type: "storage",
-              },
-              {
-                binding: this.trainingDataBuffers[layer - 1].trainingActivations,
-                name: "input_activations",
-                type: "storage",
-              },
-            ];
-          }
-          return obj;
-        }, {}),
-        this.layerBuffers.reduce((obj: any, { biasGradients }, layer) => {
-          if (layer > 0) {
-            obj[`layer${layer}`] = [
-              {
-                binding: this.gradientParamsBuffer,
-                name: "params",
-                type: "storage",
-              },
-              {
-                binding: biasGradients,
-                name: "bias_gradients",
-                type: "storage",
-              },
-            ];
-          }
-          return obj;
-        }, {}),
-      ],
+      workgroupCount: [1, 1, 1],
+      bindingLayouts: [this.getGradientInputLayout(), this.getGradientBiasLayout()],
     });
+
+    if (hasConv2d) {
+      this.conv2dBackwardWeightsShader = new ComputeShader({
+        ...commonShaderProps,
+        code: conv2dBackwardWeightsWgsl,
+        workgroupCount: [1, 1, 1],
+        bindingLayouts: [
+          { default: [{ binding: this.conv2dParamsBuffer, name: "params", type: "storage" }] },
+          this.getGradientInputLayout(),
+          this.getGradientWeightsAndBiasesLayout(),
+        ],
+      });
+    }
 
     this.updateParametersShader = new ComputeShader({
+      ...commonShaderProps,
       code: updateParametersWgsl,
-      workgroupCount: [Math.ceil(maxLayerSize / 64), 1],
+      workgroupCount: [1, 1, 1],
       bindingLayouts: [
-        {
-          default: [
-            {
-              binding: this.learningRateBuffer,
-              name: "learning_rate",
-              type: "uniform",
-            },
-          ],
-        },
-        this.layerBuffers.reduce((obj: any, { weightGradients, biasGradients }, layer) => {
-          if (layer > 0) {
-            obj[`weights_layer${layer}`] = [
-              {
-                binding: weightGradients,
-                name: "gradients",
-                type: "storage",
-              },
-            ];
-            obj[`biases_layer${layer}`] = [
-              {
-                binding: biasGradients,
-                name: "gradients",
-                type: "storage",
-              },
-            ];
-          }
-          return obj;
-        }, {}),
-        this.layerBuffers.reduce((obj: any, { weights, biases }, layer) => {
-          if (layer > 0) {
-            obj[`weights_layer${layer}`] = [
-              {
-                binding: weights,
-                name: "parameters",
-                type: "storage",
-              },
-            ];
-            obj[`biases_layer${layer}`] = [
-              {
-                binding: biases,
-                name: "parameters",
-                type: "storage",
-              },
-            ];
-          }
-          return obj;
-        }, {}),
+        { default: [{ binding: this.learningRateBuffer, name: "learning_rate", type: "uniform" }] },
+        this.getUpdateGradientLayout(),
+        this.getUpdateParamLayout(),
       ],
     });
 
-    this.isInitialized = true;
+    this.prepareDeltaShader = new ComputeShader({
+      ...commonShaderProps,
+      code: prepareDeltaWgsl,
+      workgroupCount: [1, 1, 1],
+      bindingLayouts: [
+        { default: [{ binding: this.prepareDeltaParamsBuffer, name: "params", type: "storage" }] },
+        this.getPingPongDeltaLayout(),
+        this.getPrepareDeltaDataLayout(),
+      ],
+    });
+
+    this.softmaxShader = new ComputeShader({
+      ...commonShaderProps,
+      code: softmaxWgsl,
+      workgroupCount: [1, 1, 1],
+      bindingLayouts: [this.getSoftmaxCombinedLayout()],
+    });
+
+    this.copyShader = new ComputeShader({
+      ...commonShaderProps,
+      code: copyWgsl,
+      workgroupCount: [1, 1, 1],
+      bindingLayouts: [
+        { default: [{ binding: this.copyParamsBuffer, name: "params", type: "storage" }] },
+        this.getPingPongCopyLayout(),
+      ],
+    });
+  }
+
+  // Layout Helpers
+  private getSoftmaxCombinedLayout() {
+    const layout: any = {
+      default: [
+        { binding: this.softmaxParamsBuffer, name: "params", type: "storage" },
+        { binding: this.testActivationsBufferA, name: "inputs", type: "storage" },
+        { binding: this.testActivationsBufferB, name: "outputs", type: "storage" },
+      ],
+    };
+    this.trainingDataBuffers.forEach((_, i) => {
+      if (i > 0) {
+        layout[`training_layer_${i}`] = [
+          { binding: this.softmaxParamsBuffer, name: "params", type: "storage" },
+          { binding: this.trainingDataBuffers[i].trainingZValues!, name: "inputs", type: "storage" },
+          { binding: this.trainingDataBuffers[i].trainingActivations, name: "outputs", type: "storage" },
+        ];
+        layout[`test_layer_${i % 2}`] = [
+          { binding: this.softmaxParamsBuffer, name: "params", type: "storage" },
+          { binding: this.testZValuesBuffer, name: "inputs", type: "storage" },
+          { binding: i % 2 === 1 ? this.testActivationsBufferB : this.testActivationsBufferA, name: "outputs", type: "storage" },
+        ];
+      }
+    });
+    return layout;
+  }
+
+  private getPingPongCopyLayout() {
+    return {
+      group0: [
+        { binding: this.errorGradientsABuffer, name: "input_data", type: "storage" },
+        { binding: this.errorGradientsBBuffer, name: "output_data", type: "storage" },
+      ],
+      group1: [
+        { binding: this.errorGradientsBBuffer, name: "input_data", type: "storage" },
+        { binding: this.errorGradientsABuffer, name: "output_data", type: "storage" },
+      ],
+    };
+  }
+
+  private getPrepareDeltaDataLayout() {
+    const layout: any = {};
+    this.trainingDataBuffers.forEach((_, i) => {
+      if (i > 0) {
+        layout[`training_layer_${i}`] = [
+          { binding: this.trainingDataBuffers[i].trainingZValues!, name: "z_values", type: "storage" },
+          {
+            binding: this.trainingDataBuffers[this.layers.length - 1].trainingActivations,
+            name: "predictions",
+            type: "storage",
+          },
+          { binding: this.targetsBuffer, name: "targets", type: "storage" },
+        ];
+      }
+    });
+    return layout;
+  }
+
+  private getBackpropErrorDataLayout() {
+    return this.layerBuffers.reduce((obj: any, _, i) => {
+      if (i > 0) {
+        const nextLayerBuffer = i < this.layers.length - 1 ? this.layerBuffers[i + 1] : null;
+        const weightsBinding = nextLayerBuffer?.weights ?? this.layerBuffers[i].weights;
+
+        if (weightsBinding) {
+          obj[`layer_${i}`] = [
+            {
+              binding: weightsBinding,
+              name: "weights",
+              type: "storage",
+            },
+          ];
+        }
+      }
+      return obj;
+    }, {});
+  }
+
+  private getLayerWeightsLayout() {
+    return this.layerBuffers.reduce((obj: any, { weights, biases }, i) => {
+      if (i > 0 && weights && biases) {
+        obj[`layer_${i}`] = [
+          { binding: weights, name: "weights", type: "storage" },
+          { binding: biases, name: "biases", type: "storage" },
+        ];
+      }
+      return obj;
+    }, {});
+  }
+
+  private getLayerDataLayout() {
+    const layout: any = {
+      test_layer_0: [
+        { binding: this.testActivationsBufferA, name: "inputs", type: "storage" },
+        { binding: this.testActivationsBufferB, name: "activations", type: "storage" },
+      ],
+      test_layer_1: [
+        { binding: this.testActivationsBufferB, name: "inputs", type: "storage" },
+        { binding: this.testActivationsBufferA, name: "activations", type: "storage" },
+      ],
+    };
+    this.trainingDataBuffers.forEach((_, i) => {
+      if (i > 0) {
+        layout[`training_layer_${i}`] = [
+          { binding: this.trainingDataBuffers[i - 1].trainingActivations, name: "inputs", type: "storage" },
+          { binding: this.trainingDataBuffers[i].trainingActivations, name: "activations", type: "storage" },
+        ];
+      }
+    });
+    return layout;
+  }
+
+  private getLayerZLayout() {
+    const layout: any = { test_layer: [{ binding: this.testZValuesBuffer, name: "z_values", type: "storage" }] };
+    this.trainingDataBuffers.forEach(({ trainingZValues }, i) => {
+      if (i > 0 && trainingZValues) {
+        layout[`training_layer_${i}`] = [{ binding: trainingZValues, name: "z_values", type: "storage" }];
+      }
+    });
+    return layout;
+  }
+
+  private getMaxPoolDataLayout() {
+    const layout: any = {};
+    this.trainingDataBuffers.forEach((_, i) => {
+      if (i > 0 && this.layers[i].type === LayerType.MAXPOOL2D) {
+        layout[`layer_${i}`] = [
+          { binding: this.trainingDataBuffers[i - 1].trainingActivations, name: "inputs", type: "storage" },
+          { binding: this.trainingDataBuffers[i].trainingActivations, name: "activations", type: "storage" },
+          { binding: this.layerBuffers[i].maxIndices!, name: "max_indices", type: "storage" },
+        ];
+      }
+    });
+    return layout;
+  }
+
+  private getMaxPoolBackwardDataLayout() {
+    const layout: any = {};
+    this.layerBuffers.forEach((_, i) => {
+      if (i > 0 && this.layers[i].type === LayerType.MAXPOOL2D) {
+        layout[`layer_${i}`] = [
+          { binding: this.errorGradientsABuffer, name: "next_layer_deltas", type: "storage" },
+          { binding: this.errorGradientsBBuffer, name: "current_layer_weighted_sums", type: "storage" },
+          { binding: this.layerBuffers[i].maxIndices!, name: "max_indices", type: "storage" },
+        ];
+        layout[`layer_alt_${i}`] = [
+          { binding: this.errorGradientsBBuffer, name: "next_layer_deltas", type: "storage" },
+          { binding: this.errorGradientsABuffer, name: "current_layer_weighted_sums", type: "storage" },
+          { binding: this.layerBuffers[i].maxIndices!, name: "max_indices", type: "storage" },
+        ];
+      }
+    });
+    return layout;
+  }
+
+  private getPingPongLayout() {
+    return {
+      group0: [
+        { binding: this.errorGradientsABuffer, name: "next_layer_deltas", type: "storage" },
+        { binding: this.errorGradientsBBuffer, name: "current_layer_weighted_sums", type: "storage" },
+      ],
+      group1: [
+        { binding: this.errorGradientsBBuffer, name: "next_layer_deltas", type: "storage" },
+        { binding: this.errorGradientsABuffer, name: "current_layer_weighted_sums", type: "storage" },
+      ],
+    };
+  }
+
+  private getPingPongDeltaLayout() {
+    return {
+      group0: [
+        { binding: this.errorGradientsABuffer, name: "incoming_error", type: "storage" },
+        { binding: this.errorGradientsBBuffer, name: "delta", type: "storage" },
+      ],
+      group1: [
+        { binding: this.errorGradientsBBuffer, name: "incoming_error", type: "storage" },
+        { binding: this.errorGradientsABuffer, name: "delta", type: "storage" },
+      ],
+    };
+  }
+
+  private getGradientInputLayout() {
+    const layout: any = {};
+    this.layerBuffers.forEach((_, i) => {
+      if (i > 0) {
+        layout[`layer_${i}`] = [
+          { binding: this.errorGradientsBBuffer, name: "next_layer_deltas", type: "storage" },
+          { binding: this.trainingDataBuffers[i - 1].trainingActivations, name: "input_activations", type: "storage" },
+        ];
+        layout[`layer_alt_${i}`] = [
+          { binding: this.errorGradientsABuffer, name: "next_layer_deltas", type: "storage" },
+          { binding: this.trainingDataBuffers[i - 1].trainingActivations, name: "input_activations", type: "storage" },
+        ];
+      }
+    });
+    return layout;
+  }
+
+  private getGradientWeightLayout() {
+    const layout: any = {};
+    this.layerBuffers.forEach(({ weightGradients }, i) => {
+      if (i > 0 && weightGradients) {
+        layout[`layer_${i}`] = [
+          { binding: this.gradientParamsBuffer, name: "grad_params", type: "storage" },
+          { binding: weightGradients, name: "weight_gradients", type: "storage" },
+        ];
+      }
+    });
+    return layout;
+  }
+
+  private getGradientBiasLayout() {
+    const layout: any = {};
+    this.layerBuffers.forEach(({ biasGradients }, i) => {
+      if (i > 0 && biasGradients) {
+        layout[`layer_${i}`] = [
+          { binding: this.gradientParamsBuffer, name: "grad_params", type: "storage" },
+          { binding: biasGradients, name: "bias_gradients", type: "storage" },
+        ];
+      }
+    });
+    return layout;
+  }
+
+  private getGradientWeightsAndBiasesLayout() {
+    const layout: any = {};
+    this.layerBuffers.forEach(({ weightGradients, biasGradients }, i) => {
+      if (i > 0 && weightGradients && biasGradients) {
+        layout[`layer_${i}`] = [
+          { binding: this.gradientParamsBuffer, name: "grad_params", type: "storage" },
+          { binding: weightGradients, name: "weight_gradients", type: "storage" },
+          { binding: biasGradients, name: "bias_gradients", type: "storage" },
+        ];
+      }
+    });
+    return layout;
+  }
+
+  private getUpdateGradientLayout() {
+    const layout: any = {};
+    this.layerBuffers.forEach(({ weightGradients, biasGradients }, i) => {
+      if (i > 0) {
+        if (weightGradients) layout[`weights_layer_${i}`] = [{ binding: weightGradients, name: "gradients", type: "storage" }];
+        if (biasGradients) layout[`biases_layer_${i}`] = [{ binding: biasGradients, name: "gradients", type: "storage" }];
+      }
+    });
+    return layout;
+  }
+
+  private getUpdateParamLayout() {
+    const layout: any = {};
+    this.layerBuffers.forEach(({ weights, biases }, i) => {
+      if (i > 0) {
+        if (weights) layout[`weights_layer_${i}`] = [{ binding: weights, name: "parameters", type: "storage" }];
+        if (biases) layout[`biases_layer_${i}`] = [{ binding: biases, name: "parameters", type: "storage" }];
+      }
+    });
+    return layout;
   }
 
   async forwardPass(inputActivations: Float32Array, trainMode: boolean = false) {
-    if (!this.isInitialized) {
-      throw new Error("NeuralNetwork not initialized.");
-    }
+    if (!this.isInitialized) throw new Error("NeuralNetwork not initialized.");
 
-    let batchSize = trainMode ? this.trainingBatchSize : this.testingBatchSize;
-    let inputBuffer = trainMode ? this.trainingDataBuffers[0].trainingActivations : this.testActivationsBufferA;
+    const batchSize = trainMode ? this.trainingBatchSize : this.testingBatchSize;
+    const inputBuffer = trainMode ? this.trainingDataBuffers[0].trainingActivations : this.testActivationsBufferA;
 
     if (inputActivations.length !== batchSize * this.inputSize) {
       throw new Error(`Expected ${batchSize * this.inputSize} elements, got ${inputActivations.length}`);
     }
 
     inputBuffer.write(inputActivations);
-    const numLayers = this.layerSizes.length;
 
-    for (let layer = 1; layer < numLayers; layer++) {
-      this.forwardPassParamsBuffer.write(
-        new Uint32Array([
-          batchSize,
-          this.layerSizes[layer - 1],
-          this.layerSizes[layer],
-          layer === numLayers - 1 ? this.outputActivationType : this.hiddenActivationType,
-        ])
-      );
+    for (let i = 1; i < this.layers.length; i++) {
+      const layer = this.layers[i];
+      const prevLayer = this.layers[i - 1];
+      const activationType = i === this.layers.length - 1 ? this.outputActivationType : (layer.config as any).activation ?? this.hiddenActivationType;
 
-      this.forwardPassShader.dispatch({
-        bindGroups: {
-          1: `layer_${layer}`,
-          2: trainMode ? `training_layer_${layer}` : `test_layer_${(layer + 1) % 2}`,
-          3: trainMode ? `training_layer_${layer}` : `test_layer`,
-        },
-      });
+      if (layer.type === LayerType.DENSE) {
+        this.forwardPassParamsBuffer.write(new Uint32Array([batchSize, prevLayer.size, layer.size, activationType]));
+        
+        // Dynamic workgroup count for Dense
+        this.forwardPassShader.props.workgroupCount = [Math.ceil((batchSize * layer.size) / 64), 1, 1];
+        
+        this.forwardPassShader.dispatch({
+          bindGroups: {
+            1: `layer_${i}`,
+            2: trainMode ? `training_layer_${i}` : `test_layer_${(i + 1) % 2}`,
+            3: trainMode ? `training_layer_${i}` : `test_layer`,
+          },
+        });
+      } else if (layer.type === LayerType.CONV2D) {
+        const c = layer.config as any;
+        const [inH, inW, inC] = prevLayer.shape;
+        const [outH, outW, outC] = layer.shape;
+        this.conv2dParamsBuffer.write(new Uint32Array([
+          batchSize, inH, inW, inC, outH, outW, outC, c.kernelSize, c.stride ?? 1, c.padding ?? 0, activationType
+        ]));
+        
+        if (this.conv2dForwardShader) {
+          // Dynamic workgroup count for Conv2D: [Math.ceil(outW / 16), Math.ceil(outH / 16), batchSize * outC]
+          this.conv2dForwardShader.props.workgroupCount = [
+            Math.ceil(outW / 16),
+            Math.ceil(outH / 16),
+            batchSize * outC
+          ];
+
+          this.conv2dForwardShader.dispatch({
+            bindGroups: {
+              1: `layer_${i}`,
+              2: trainMode ? `training_layer_${i}` : `test_layer_${(i + 1) % 2}`,
+              3: trainMode ? `training_layer_${i}` : `test_layer`,
+            },
+          });
+        }
+      } else if (layer.type === LayerType.MAXPOOL2D) {
+        const c = layer.config as any;
+        const [inH, inW, inC] = prevLayer.shape;
+        const [outH, outW, outC] = layer.shape;
+        this.maxpool2dParamsBuffer.write(new Uint32Array([
+          batchSize, inH, inW, inC, outH, outW, c.poolSize, c.stride ?? c.poolSize
+        ]));
+        
+        if (this.maxpool2dForwardShader) {
+          // Dynamic workgroup count for MaxPool2D
+          this.maxpool2dForwardShader.props.workgroupCount = [
+            Math.ceil(outW / 16),
+            Math.ceil(outH / 16),
+            batchSize * outC
+          ];
+
+          this.maxpool2dForwardShader.dispatch({
+            bindGroups: { 1: `layer_${i}` }, // Uses custom layout for MaxPool
+          });
+        }
+      } else if (layer.type === LayerType.FLATTEN) {
+        // Flatten is logical. Next layer's forward pass will correctly 
+        // reference this layer's output because of how getLayerDataLayout is structured.
+        // No action needed here unless we want to copy for some reason.
+      }
+
+      // Handle Softmax if it's the output layer
+      if (i === this.layers.length - 1 && activationType === ActivationType.SOFTMAX) {
+          this.softmaxParamsBuffer.write(new Uint32Array([batchSize, layer.size]));
+          this.softmaxShader.props.workgroupCount = [Math.ceil(batchSize / 64), 1, 1];
+          this.softmaxShader.dispatch({
+              bindGroups: {
+                  0: trainMode ? `training_layer_${i}` : `test_layer_${i % 2}`
+              }
+          });
+      }
     }
-
-    let finalActivations: Float32Array | null = null;
 
     if (!trainMode) {
-      let lastLayerBuffer = [this.testActivationsBufferB, this.testActivationsBufferA][this.layerSizes.length % 2];
-      finalActivations = (await lastLayerBuffer.read()) as Float32Array;
+      const lastLayerBuffer = [this.testActivationsBufferB, this.testActivationsBufferA][this.layers.length % 2];
+      return (await lastLayerBuffer.read()) as Float32Array;
     }
-
-    return finalActivations!;
+    return null as any;
   }
 
   private async backwardPass(learningRate: number) {
-    if (!this.isInitialized) {
-      throw new Error("NeuralNetwork not initialized.");
-    }
+    if (!this.isInitialized) throw new Error("NeuralNetwork not initialized.");
 
-    const numLayers = this.layerSizes.length;
-
-    // Update learning rate buffer
     await this.learningRateBuffer.write(new Float32Array([learningRate]));
 
-    for (let layer = numLayers - 1; layer >= 1; layer--) {
-      // Determine ping-pong buffer group
-      const errorBufferGroup = layer % 2 === 0 ? "group0" : "group1";
-      const errorBufferName = layer % 2 === 0 ? "layer_alt" : "layer";
+    for (let i = this.layers.length - 1; i >= 1; i--) {
+      const layer = this.layers[i];
+      const prevLayer = this.layers[i - 1];
+      const activationType = i === this.layers.length - 1 ? this.outputActivationType : (layer.config as any).activation ?? this.hiddenActivationType;
 
-      // Update backward pass params
-      this.backwardPassParamsBuffer.write(
-        new Uint32Array([
-          this.trainingBatchSize,
-          this.layerSizes[layer],
-          layer < numLayers - 1 ? this.layerSizes[layer + 1] : 0,
-          layer === numLayers - 1 ? this.outputActivationType : this.hiddenActivationType, // activation_type
-          layer === numLayers - 1 ? 1 : 0, // is_output_layer
-        ])
-      );
+      // Fixed buffer assignment for simplicity: 
+      // Buffer A (errorGradientsABuffer) always holds weighted sums
+      // Buffer B (errorGradientsBBuffer) always holds deltas
+      const prepareDeltaGroup = "group0"; // A -> B
+      const propagateErrorGroup = "group1"; // B -> A
+      const deltaBufferName = "layer"; // uses Buffer B for next_layer_deltas
 
-      // Propagate errors backward
-      this.backwardErrorShader.dispatch({
+      // Step A: Prepare Delta
+      // delta = incoming_error * activation_derivative(z)
+      this.prepareDeltaParamsBuffer.write(new Uint32Array([
+        this.trainingBatchSize, layer.size, activationType, i === this.layers.length - 1 ? 1 : 0
+      ]));
+      this.prepareDeltaShader.props.workgroupCount = [Math.ceil((this.trainingBatchSize * layer.size) / 64), 1, 1];
+      this.prepareDeltaShader.dispatch({
         bindGroups: {
-          0: errorBufferGroup,
-          1: `layer${layer}`,
-        },
+          1: prepareDeltaGroup,
+          2: `training_layer_${i}`
+        }
       });
 
-      // Update gradient computation params
-      this.gradientParamsBuffer.write(
-        new Uint32Array([
-          this.trainingBatchSize,
-          this.layerSizes[layer - 1], // input_size
-          this.layerSizes[layer], // output_size
-          0, // accumulate (0 = overwrite)
-        ])
-      );
+      // Step B: Compute Gradients
+      // weight_grad = delta * input_activations
+      if (layer.type === LayerType.DENSE) {
+        this.gradientParamsBuffer.write(new Uint32Array([this.trainingBatchSize, prevLayer.size, layer.size, 0]));
+        this.weightGradientComputationShader.props.workgroupCount = [Math.ceil((layer.size * prevLayer.size) / 256), 1, 1];
+        this.weightGradientComputationShader.dispatch({
+          bindGroups: {
+            0: `${deltaBufferName}_${i}`,
+            1: `layer_${i}`
+          }
+        });
+        this.biasGradientComputationShader.props.workgroupCount = [layer.size, 1, 1];
+        this.biasGradientComputationShader.dispatch({
+          bindGroups: {
+            0: `${deltaBufferName}_${i}`,
+            1: `layer_${i}`
+          }
+        });
+      } else if (layer.type === LayerType.CONV2D) {
+        const c = layer.config as any;
+        const [inH, inW, inC] = prevLayer.shape;
+        const [outH, outW, outC] = layer.shape;
+        this.conv2dParamsBuffer.write(new Uint32Array([
+          this.trainingBatchSize, inH, inW, inC, outH, outW, outC, c.kernelSize, c.stride ?? 1, c.padding ?? 0, activationType
+        ]));
+        if (this.conv2dBackwardWeightsShader) {
+          const totalWeights = c.kernelSize * c.kernelSize * inC * outC;
+          this.conv2dBackwardWeightsShader.props.workgroupCount = [Math.ceil(totalWeights / 64), 1, 1];
+          this.conv2dBackwardWeightsShader.dispatch({
+            bindGroups: {
+              0: "default",
+              1: `${deltaBufferName}_${i}`,
+              2: `layer_${i}`
+            },
+          });
+        }
+      }
 
-      // Compute weight gradients
-      this.weightGradientComputationShader.dispatch({
-        bindGroups: {
-          0: `${errorBufferName}${layer}`,
-          1: `layer${layer}`,
-        },
-      });
+      // Step C: Propagate Error to previous layer
+      // incoming_error_prev = weights^T * delta
+      if (i > 1) { // No need to propagate error to the input layer
+        if (layer.type === LayerType.DENSE) {
+          this.backwardPassParamsBuffer.write(new Uint32Array([this.trainingBatchSize, prevLayer.size, layer.size]));
+          this.backwardErrorShader.props.workgroupCount = [Math.ceil((this.trainingBatchSize * prevLayer.size) / 64), 1, 1];
+          this.backwardErrorShader.dispatch({
+            bindGroups: {
+              0: propagateErrorGroup,
+              1: `layer_${i}`
+            }
+          });
+        } else if (layer.type === LayerType.CONV2D) {
+          const [inH, inW, inC] = prevLayer.shape;
+          if (this.conv2dBackwardDataShader) {
+            this.conv2dBackwardDataShader.props.workgroupCount = [
+              Math.ceil(inW / 16),
+              Math.ceil(inH / 16),
+              this.trainingBatchSize * inC
+            ];
+            this.conv2dBackwardDataShader.dispatch({
+              bindGroups: {
+                0: "default",
+                1: propagateErrorGroup,
+                2: `layer_${i}`
+              },
+            });
+          }
+        } else if (layer.type === LayerType.MAXPOOL2D) {
+          const [inH, inW, inC] = prevLayer.shape;
+          if (this.maxpool2dBackwardShader) {
+            this.maxpool2dBackwardShader.props.workgroupCount = [
+              Math.ceil(inW / 16),
+              Math.ceil(inH / 16),
+              this.trainingBatchSize * inC
+            ];
+            this.maxpool2dBackwardShader.dispatch({
+              bindGroups: {
+                0: "default",
+                1: `layer_alt_${i}`
+              }
+            });
+          }
+        } else if (layer.type === LayerType.FLATTEN) {
+          const size = this.trainingBatchSize * layer.size;
+          this.copyParamsBuffer.write(new Uint32Array([size]));
+          this.copyShader.props.workgroupCount = [Math.ceil(size / 64), 1, 1];
+          this.copyShader.dispatch({
+            bindGroups: {
+              1: propagateErrorGroup
+            }
+          });
+        }
+      }
 
-      // Compute bias gradients
-      this.biasGradientComputationShader.dispatch({
-        bindGroups: {
-          0: `${errorBufferName}${layer}`,
-          1: `layer${layer}`,
-        },
-      });
-
-      // Update weights
-      this.updateParametersShader.dispatch({
-        bindGroups: {
-          1: `weights_layer${layer}`,
-          2: `weights_layer${layer}`,
-        },
-      });
-
-      // Update biases
-      this.updateParametersShader.dispatch({
-        bindGroups: {
-          1: `biases_layer${layer}`,
-          2: `biases_layer${layer}`,
-        },
-      });
+      // Update Parameters
+      if (this.layerBuffers[i].weights) {
+        const totalParams = this.layerBuffers[i].weights!.sizeElements;
+        this.updateParametersShader.props.workgroupCount = [Math.ceil(totalParams / 256), 1, 1];
+        this.updateParametersShader.dispatch({ bindGroups: { 1: `weights_layer_${i}`, 2: `weights_layer_${i}` } });
+      }
+      if (this.layerBuffers[i].biases) {
+        const totalParams = this.layerBuffers[i].biases!.sizeElements;
+        this.updateParametersShader.props.workgroupCount = [Math.ceil(totalParams / 256), 1, 1];
+        this.updateParametersShader.dispatch({ bindGroups: { 1: `biases_layer_${i}`, 2: `biases_layer_${i}` } });
+      }
     }
   }
 
   private async lossPass() {
-    await this.lossParamsBuffer.write(
-      new Uint32Array([this.trainingBatchSize, this.outputSize, 0, 0, LOSS_MULTIPLIER])
-    );
-
+    const isSoftmax = this.outputActivationType === ActivationType.SOFTMAX;
+    const lossType = isSoftmax ? 1 : 0; // 1 for Cross-Entropy, 0 for MSE
+    
+    await this.lossParamsBuffer.write(new Uint32Array([this.trainingBatchSize, this.outputSize, lossType, 0, LOSS_MULTIPLIER]));
+    
+    // Dynamic dispatch for loss calculation
+    this.lossShader.props.workgroupCount = [Math.ceil(this.trainingBatchSize / 64), 1, 1];
+    
     this.lossShader.dispatch();
-
-    const lossData = (await this.totalBatchLossBuffer.read()) as Uint32Array;
-    return lossData[0];
+    return ((await this.totalBatchLossBuffer.read()) as Uint32Array)[0];
   }
 
   async train(props: TrainOptions) {
-    {
-      // Validation
-      if (!this.isInitialized) {
-        throw new Error("NeuralNetwork not initialized.");
-      }
-      if (props?.inputActivations.length !== props?.targetActivations.length) {
-        throw new Error("Inputs and targets must have the same number of samples.");
-      }
-      for (let i = 0; i < props.targetActivations.length; i++) {
-        if (props.targetActivations[i].length !== this.outputSize) {
-          throw new Error("Target size does not match output layer size.");
-        }
-      }
-      if (props?.inputActivations[0].length !== this.inputSize) {
-        throw new Error("Input size does not match input layer size.");
-      }
-    }
-
+    if (!this.isInitialized) throw new Error("NeuralNetwork not initialized.");
     const learningRate = props.learningRate ?? 0.01;
     const epochs = props.epochs ?? 1;
 
     for (let epoch = 0; epoch < epochs; epoch++) {
-      let numSamples = props?.inputActivations.length;
+      const numSamples = props.inputActivations.length;
       let epochLoss = 0;
+      const indices = Array.from({ length: numSamples }, (_, i) => i).sort(() => Math.random() - 0.5);
 
-      {
-        // Shuffle inputActivations and targetActivations, but keep them in sync.
-        const shuffledIndices = Array.from({ length: numSamples }, (_, i) => i);
-        shuffledIndices.sort(() => Math.random() - 0.5);
-        const shuffledInputActivations = shuffledIndices.map((i) => props.inputActivations[i]);
-        const shuffledTargetActivations = shuffledIndices.map((i) => props.targetActivations[i]);
-        props.inputActivations = shuffledInputActivations;
-        props.targetActivations = shuffledTargetActivations;
-      }
-
-      // Process in batches
       for (let batchStart = 0; batchStart < numSamples; batchStart += this.trainingBatchSize) {
-        const batchEnd = Math.min(batchStart + this.trainingBatchSize, numSamples);
-        const actualBatchSize = batchEnd - batchStart;
+        if (batchStart + this.trainingBatchSize > numSamples) continue;
 
-        // Skip incomplete batches (or handle them separately)
-        if (actualBatchSize < this.trainingBatchSize) continue;
-
-        // Concatenate batch samples into single array
         const batchInputs = new Float32Array(this.trainingBatchSize * this.inputSize);
         const batchTargets = new Float32Array(this.trainingBatchSize * this.outputSize);
 
         for (let i = 0; i < this.trainingBatchSize; i++) {
-          const sampleIdx = batchStart + i;
-          batchInputs.set(props.inputActivations[sampleIdx], i * this.inputSize);
-          batchTargets.set(props.targetActivations[sampleIdx], i * this.outputSize);
+          const idx = indices[batchStart + i];
+          batchInputs.set(props.inputActivations[idx], i * this.inputSize);
+          batchTargets.set(props.targetActivations[idx], i * this.outputSize);
         }
 
         await this.targetsBuffer.write(batchTargets);
-
-        // Forward pass on entire batch
         await this.forwardPass(batchInputs, true);
-
-        // Compute loss for batch
-        this.totalBatchLossBuffer.write(new Uint32Array([0]));
-        let batchLoss = props.progressCallback ? (await this.lossPass()) / LOSS_MULTIPLIER : 0;
+        await this.totalBatchLossBuffer.write(new Uint32Array([0]));
+        const batchLoss = props.progressCallback ? (await this.lossPass()) / LOSS_MULTIPLIER : 0;
         epochLoss += batchLoss / (numSamples / this.trainingBatchSize);
-
-        // Backward pass updates weights once for entire batch
         await this.backwardPass(learningRate);
       }
-
-      // console.log(`Epoch ${epoch + 1} loss: ${epochLoss}`);
       props.progressCallback?.(epoch, epochLoss);
     }
   }
 
   // === Genetic Evaluation (Forward + Loss per genome) ===
-  // Evaluates a population of genomes in parallel without affecting training state
   async evaluatePopulation(props: EvaluatePopulationOptions) {
-    if (!this.isInitialized) {
-      throw new Error("NeuralNetwork not initialized.");
-    }
+    if (!this.isInitialized) throw new Error("NeuralNetwork not initialized.");
 
     const P = props.populationSize;
     const B = props.batchSize;
-    const numLayers = this.layerSizes.length;
+    const numLayers = this.layers.length;
 
-    if (P < 1 || B < 1) {
-      throw new Error("populationSize and batchSize must be >= 1");
-    }
-    if (!props.weights || !props.biases || props.weights.length !== numLayers || props.biases.length !== numLayers) {
-      throw new Error(
-        "weights/biases must be provided per layer index (same length as layerSizes). Use empty slot at index 0."
-      );
-    }
-    if (!props.inputs || props.inputs.length !== P) {
-      throw new Error("inputs must be provided per genome.");
-    }
-    for (let g = 0; g < P; g++) {
-      if (props.inputs[g].length !== B * this.inputSize) {
-        throw new Error(`inputs[${g}] length must equal batchSize*inputSize`);
-      }
-    }
-    if (props.returnLoss) {
-      if (!props.targets || props.targets.length !== P) {
-        throw new Error("targets must be provided per genome when returnLoss is true.");
-      }
-      for (let g = 0; g < P; g++) {
-        if (props.targets[g].length !== B * this.outputSize) {
-          throw new Error(`targets[${g}] length must equal batchSize*outputSize`);
+    // Check if we need to re-initialize genetic assets (if size changed)
+    const needsReinit = P !== this.currentGeneticPopulationSize || B !== this.currentGeneticBatchSize;
+
+    if (needsReinit) {
+      this.currentGeneticPopulationSize = P;
+      this.currentGeneticBatchSize = B;
+
+      // Dispose old buffers if needed (simple-compute-shaders might need explicit disposal, but let's assume GC for now)
+      this.geneticWeightsBuffers = new Array(numLayers);
+      this.geneticBiasesBuffers = new Array(numLayers);
+      this.geneticActivationsBuffers = new Array(numLayers);
+
+      this.geneticActivationsBuffers[0] = new StorageBuffer({
+        dataType: "array<f32>",
+        size: P * B * this.inputSize,
+        canCopyDst: true,
+      });
+
+      for (let i = 1; i < numLayers; i++) {
+        const layer = this.layers[i];
+        const prevLayer = this.layers[i - 1];
+
+        if (layer.type === LayerType.DENSE) {
+          const weightSize = prevLayer.size * layer.size;
+          this.geneticWeightsBuffers[i] = new StorageBuffer({
+            dataType: "array<f32>",
+            size: P * weightSize,
+            canCopyDst: true,
+          });
+          this.geneticBiasesBuffers[i] = new StorageBuffer({
+            dataType: "array<f32>",
+            size: P * layer.size,
+            canCopyDst: true,
+          });
+          this.geneticActivationsBuffers[i] = new StorageBuffer({
+            dataType: "array<f32>",
+            size: P * B * layer.size,
+            canCopySrc: true,
+          });
+        } else {
+          throw new Error(`Genetic evaluation not yet implemented for layer type: ${layer.type}`);
         }
       }
+
+      this.forwardGeneticShader = new ComputeShader({
+        useExecutionCountBuffer: false,
+        useTimeBuffer: false,
+        code: forwardPassGeneticWgsl,
+        workgroupCount: [1024, 1], // Placeholder
+        bindingLayouts: [
+          { default: [{ binding: this.forwardGeneticParamsBuffer, name: "params", type: "storage" }] },
+          this.geneticWeightsBuffers.reduce((obj: any, _, i) => {
+            if (i > 0)
+              obj[`layer_${i}`] = [
+                { binding: this.geneticWeightsBuffers[i], name: "weights", type: "storage" },
+                { binding: this.geneticBiasesBuffers[i], name: "biases", type: "storage" },
+              ];
+            return obj;
+          }, {}),
+          this.geneticActivationsBuffers.reduce((obj: any, _, i) => {
+            if (i > 0)
+              obj[`layer_${i}`] = [
+                { binding: this.geneticActivationsBuffers[i - 1], name: "inputs", type: "storage" },
+                { binding: this.geneticActivationsBuffers[i], name: "activations", type: "storage" },
+              ];
+            return obj;
+          }, {}),
+          { default: [] }, // No z-values
+        ],
+      });
     }
 
-    // Pack per-layer weights/biases across genomes
-    const genWeights: StorageBuffer[] = new Array(numLayers);
-    const genBiases: StorageBuffer[] = new Array(numLayers);
-    const genZValues: StorageBuffer[] = new Array(numLayers);
-    const genActivations: StorageBuffer[] = new Array(numLayers);
-
-    // Inputs buffer is activations of layer 0
+    // Pack and write data to buffers
     const packedInputs = new Float32Array(P * B * this.inputSize);
     for (let g = 0; g < P; g++) {
       packedInputs.set(props.inputs[g], g * B * this.inputSize);
     }
-    genActivations[0] = new StorageBuffer({
-      dataType: "array<f32>",
-      size: P * B * this.inputSize,
-      canCopyDst: true,
-      canCopySrc: false,
-      initialValue: packedInputs,
-    });
+    await this.geneticActivationsBuffers[0].write(packedInputs);
 
-    let maxLayerSize = Math.max(...this.layerSizes);
+    for (let i = 1; i < numLayers; i++) {
+      const layer = this.layers[i];
+      const prevLayer = this.layers[i - 1];
 
-    for (let layer = 1; layer < numLayers; layer++) {
-      const inputSize = this.layerSizes[layer - 1];
-      const outputSize = this.layerSizes[layer];
-
-      // Pack weights: [genome, out, in]
-      const packedWeights = new Float32Array(P * outputSize * inputSize);
-      const packedBiases = new Float32Array(P * outputSize);
-      for (let g = 0; g < P; g++) {
-        const w = props.weights[layer][g];
-        const b = props.biases[layer][g];
-        if (!w || w.length !== inputSize * outputSize) {
-          throw new Error(`weights[layer=${layer}][${g}] size mismatch`);
+      if (layer.type === LayerType.DENSE) {
+        const weightSize = prevLayer.size * layer.size;
+        const packedWeights = new Float32Array(P * weightSize);
+        const packedBiases = new Float32Array(P * layer.size);
+        for (let g = 0; g < P; g++) {
+          packedWeights.set(props.weights[i][g], g * weightSize);
+          packedBiases.set(props.biases[i][g], g * layer.size);
         }
-        if (!b || b.length !== outputSize) {
-          throw new Error(`biases[layer=${layer}][${g}] size mismatch`);
-        }
-        packedWeights.set(w, g * outputSize * inputSize);
-        packedBiases.set(b, g * outputSize);
+        await this.geneticWeightsBuffers[i].write(packedWeights);
+        await this.geneticBiasesBuffers[i].write(packedBiases);
       }
-
-      genWeights[layer] = new StorageBuffer({
-        dataType: "array<f32>",
-        size: P * outputSize * inputSize,
-        canCopyDst: true,
-        canCopySrc: false,
-        initialValue: packedWeights,
-      });
-      genBiases[layer] = new StorageBuffer({
-        dataType: "array<f32>",
-        size: P * outputSize,
-        canCopyDst: true,
-        canCopySrc: false,
-        initialValue: packedBiases,
-      });
-
-      genZValues[layer] = new StorageBuffer({
-        dataType: "array<f32>",
-        size: P * B * outputSize,
-        canCopyDst: false,
-        canCopySrc: false,
-      });
-      genActivations[layer] = new StorageBuffer({
-        dataType: "array<f32>",
-        size: P * B * outputSize,
-        canCopyDst: false,
-        canCopySrc: true,
-      });
     }
 
-    // Forward genetic shader and params buffer
-    const forwardGeneticParamsBuffer = new StorageBuffer({
-      dataType: "struct",
-      structName: "GeneticLayerParams",
-      fields: [
-        { name: "population_size", dataType: "u32" },
-        { name: "batch_size", dataType: "u32" },
-        { name: "input_size", dataType: "u32" },
-        { name: "output_size", dataType: "u32" },
-        { name: "activation_type", dataType: "u32" },
-      ],
-      canCopyDst: true,
-    });
+    const maxLayerSize = Math.max(...this.layers.map((l) => l.size));
 
-    const forwardGeneticShader = new ComputeShader({
-      useExecutionCountBuffer: false,
-      useTimeBuffer: false,
-      code: forwardPassGeneticWgsl,
-      workgroupCount: [Math.ceil((P * B * maxLayerSize) / 64), 1],
-      bindingLayouts: [
-        { default: [{ binding: forwardGeneticParamsBuffer, name: "params", type: "storage" }] },
-        // Group 1: weights/biases per layer
-        genWeights.reduce((obj: any, wb, layer) => {
-          if (layer > 0) {
-            obj[`layer_${layer}`] = [
-              { binding: genWeights[layer], name: "weights", type: "storage" },
-              { binding: genBiases[layer], name: "biases", type: "storage" },
-            ];
-          }
-          return obj;
-        }, {}),
-        // Group 2: inputs/activations per layer
-        genActivations.reduce((obj: any, _, layer) => {
-          if (layer > 0) {
-            obj[`layer_${layer}`] = [
-              { binding: genActivations[layer - 1], name: "inputs", type: "storage" },
-              { binding: genActivations[layer], name: "activations", type: "storage" },
-            ];
-          }
-          return obj;
-        }, {}),
-        // Group 3: z_values per layer
-        genZValues.reduce((obj: any, _, layer) => {
-          if (layer > 0) {
-            obj[`layer_${layer}`] = [
-              { binding: genZValues[layer], name: "z_values", type: "storage" },
-            ];
-          }
-          return obj;
-        }, {}),
-      ],
-    });
+    for (let i = 1; i < numLayers; i++) {
+      const layer = this.layers[i];
+      const prevLayer = this.layers[i - 1];
+      const activationType =
+        i === numLayers - 1 ? this.outputActivationType : (layer.config as any).activation ?? this.hiddenActivationType;
 
-    // Run forward pass across layers
-    for (let layer = 1; layer < numLayers; layer++) {
-      forwardGeneticParamsBuffer.write(
-        new Uint32Array([
-          P,
-          B,
-          this.layerSizes[layer - 1],
-          this.layerSizes[layer],
-          layer === numLayers - 1 ? this.outputActivationType : this.hiddenActivationType,
-        ])
-      );
-      forwardGeneticShader.dispatch({
+      await this.forwardGeneticParamsBuffer.write(new Uint32Array([P, B, prevLayer.size, layer.size, activationType]));
+
+      // Dynamic workgroup count for Genetic Forward Pass
+      const totalOutputs = P * B * layer.size;
+      this.forwardGeneticShader.props.workgroupCount = [Math.ceil(totalOutputs / 64), 1, 1];
+
+      this.forwardGeneticShader.dispatch({
         bindGroups: {
-          1: `layer_${layer}`,
-          2: `layer_${layer}`,
-          3: `layer_${layer}`,
+          1: `layer_${i}`,
+          2: `layer_${i}`,
         },
       });
     }
 
-    // Optionally compute loss per genome
-    let losses: Float32Array | null = null;
-    if (props.returnLoss) {
-      // Pack targets
-      const packedTargets = new Float32Array(P * B * this.outputSize);
-      for (let g = 0; g < P; g++) {
-        packedTargets.set(props.targets![g], g * B * this.outputSize);
-      }
-      const targetsBuffer = new StorageBuffer({
-        dataType: "array<f32>",
-        size: P * B * this.outputSize,
-        canCopyDst: true,
-        canCopySrc: false,
-        initialValue: packedTargets,
-      });
-      const totalLossBuffer = new StorageBuffer({
-        dataType: "array<atomic<u32>>",
-        size: P,
-        canCopyDst: true,
-        canCopySrc: true,
-        initialValue: new Uint32Array(P).fill(0),
-      });
-      const geneticLossParamsBuffer = new StorageBuffer({
-        dataType: "struct",
-        structName: "GeneticLossParams",
-        fields: [
-          { name: "population_size", dataType: "u32" },
-          { name: "batch_size", dataType: "u32" },
-          { name: "output_size", dataType: "u32" },
-          { name: "loss_type", dataType: "u32" },
-          { name: "reduction", dataType: "u32" },
-          { name: "loss_multiplier", dataType: "u32" },
-        ],
-        canCopyDst: true,
-        canCopySrc: true,
-      });
-
-      await geneticLossParamsBuffer.write(
-        new Uint32Array([P, B, this.outputSize, 0, 0, LOSS_MULTIPLIER])
-      );
-
-      const lossGeneticShader = new ComputeShader({
-        code: lossGeneticWgsl,
-        workgroupCount: [Math.ceil((P * B) / 64), 1],
-        bindingLayouts: [
-          {
-            default: [
-              { binding: geneticLossParamsBuffer, name: "params", type: "storage" },
-              { binding: genActivations[numLayers - 1], name: "predictions", type: "storage" },
-              { binding: targetsBuffer, name: "targets", type: "storage" },
-              { binding: totalLossBuffer, name: "total_loss", type: "storage" },
-            ],
-          },
-        ],
-      });
-
-      // zero totals and dispatch
-      await totalLossBuffer.write(new Uint32Array(P).fill(0));
-      lossGeneticShader.dispatch();
-      const totals = (await totalLossBuffer.read()) as Uint32Array;
-      losses = new Float32Array(P);
-      for (let g = 0; g < P; g++) {
-        losses[g] = totals[g] / LOSS_MULTIPLIER / B;
-      }
-    }
-
     let activations: Float32Array | null = null;
     if (props.returnActivations) {
-      activations = (await genActivations[numLayers - 1].read()) as Float32Array;
+      activations = (await this.geneticActivationsBuffers[numLayers - 1].read()) as Float32Array;
     }
 
-    return { losses, activations };
+    return { losses: null, activations };
   }
 }

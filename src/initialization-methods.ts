@@ -1,24 +1,24 @@
 export default class InitializationMethods {
   // Xavier/Glorot: Good for sigmoid/tanh activations
-  static initXavier(inputSize: number, outputSize: number): Float32Array {
-    const scale = Math.sqrt(1 / inputSize);
-    return InitializationMethods.randomArray(inputSize * outputSize, -scale, scale);
+  static initXavier(fanIn: number, fanOut: number, totalSize?: number): Float32Array {
+    const scale = Math.sqrt(1 / fanIn);
+    return InitializationMethods.randomArray(totalSize ?? fanIn * fanOut, -scale, scale);
   }
 
   // He initialization: Better for ReLU networks
-  static initHe(inputSize: number, outputSize: number): Float32Array {
-    const scale = Math.sqrt(2 / inputSize); // Note the 2 factor
-    return InitializationMethods.randomArray(inputSize * outputSize, -scale, scale);
+  static initHe(fanIn: number, fanOut: number, totalSize?: number): Float32Array {
+    const scale = Math.sqrt(2 / fanIn); // Note the 2 factor
+    return InitializationMethods.randomArray(totalSize ?? fanIn * fanOut, -scale, scale);
   }
 
   // Uniform random in range
-  static initUniform(inputSize: number, outputSize: number, min: number, max: number): Float32Array {
-    return InitializationMethods.randomArray(inputSize * outputSize, min, max);
+  static initUniform(size: number, min: number, max: number): Float32Array {
+    return InitializationMethods.randomArray(size, min, max);
   }
 
   // Zero initialization (usually bad, but sometimes needed)
-  static initZero(inputSize: number, outputSize: number): Float32Array {
-    return new Float32Array(inputSize * outputSize); // Already zeros
+  static initZero(size: number): Float32Array {
+    return new Float32Array(size); // Already zeros
   }
 
   // Helper for random arrays

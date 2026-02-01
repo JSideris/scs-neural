@@ -73,8 +73,7 @@ fn main(
     let bias_idx = genome_idx * params.output_size + output_idx;
     let z_value = accumulator + biases[bias_idx];
 
-    // Store z and activation
-    z_values[output_linear_idx] = z_value;
+    // Store activation
     let activated_value = apply_activation(z_value, params.activation_type);
     activations[output_linear_idx] = activated_value;
 }

@@ -1,15 +1,9 @@
-// Combined Dense Layer Forward Pass + Activation Function
-// Computes: output = activation(weights × input + bias)
-
-// Uniform parameters for layer configuration
 struct LayerParams {
     batch_size: u32,
-    input_size: u32, 
+    input_size: u32,
     output_size: u32,
-    activation_type: u32,  // 0 = ReLU, 1 = Sigmoid
+    activation_type: u32,
 }
-
-// Buffers are added at runtime.
 
 // Activation functions
 fn relu(x: f32) -> f32 {
@@ -29,7 +23,6 @@ fn apply_activation(x: f32, activation_type: u32) -> f32 {
         case 1u: { return sigmoid(x); }
         case 2u: { return x; }
         case 3u: { return tanh(x); } // built-in.
-        // case 4u: { return softmax(x); } // A bit more tricky. Need to think about it.
         default: { return x; } // Linear (no activation)
     }
 }
@@ -72,7 +65,7 @@ fn main(
     // Add bias term
     let z_value = accumulator + biases[output_idx];
     
-    // Store z-value for backpropagation (ADDED THIS LINE)
+    // Store z-value for backpropagation
     z_values[output_linear_idx] = z_value;
     
     // Apply activation function

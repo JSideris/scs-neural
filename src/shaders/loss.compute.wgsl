@@ -1,17 +1,10 @@
 struct LossParams {
     batch_size: u32,
     output_size: u32,
-    loss_type: u32,    // 0 = MSE, 1 = Cross-entropy (future)
-    reduction: u32,    // 0 = mean, 1 = sum, 2 = none (per-sample)
+    loss_type: u32,
+    reduction: u32,
     loss_multiplier: u32,
 }
-
-// // Buffer bindings - added at runtime.
-// @group(0) @binding(0) var<uniform> params: LossParams;
-// @group(0) @binding(1) var<storage, read> predictions: array<f32>;        // [batch_size, output_size]
-// @group(0) @binding(2) var<storage, read> targets: array<f32>;            // [batch_size, output_size]
-// @group(0) @binding(3) var<storage, read_write> total_loss: array<atomic<u32>>;     // [1] - reduced total loss
-// @group(0) @binding(4) var<storage, read_write> sample_losses: array<f32>;  // [batch_size] - per-sample losses
 
 // Loss functions
 fn mse_loss(prediction: f32, targetValue: f32) -> f32 {
@@ -64,10 +57,6 @@ fn main(
         if (params.loss_type == 0u) {
             sample_loss = sample_loss / f32(params.output_size);
         }
-        
-        // Store per-sample loss
-        // We don't actually need this.
-        // sample_losses[batch_idx] = sample_loss;
     }
     
     // === Reduction to compute total loss ===
@@ -78,9 +67,9 @@ fn main(
     workgroupBarrier();
     
     // Parallel reduction in shared memory
-    var stride: u32 = 128u;
+    var stride: u32 = 32u;
     while (stride > 0u) {
-        if (local_idx < stride && local_idx + stride < 256u) {
+        if (local_idx < stride) {
             shared_data[local_idx] = shared_data[local_idx] + shared_data[local_idx + stride];
         }
         workgroupBarrier();
@@ -94,7 +83,4 @@ fn main(
         // Atomic add to accumulate across workgroups
         atomicAdd(&total_loss[0], u32(workgroup_sum * f32(params.loss_multiplier)));
     }
-    
-    // Note: The calling code should zero out total_loss[0] before dispatch
-    // and apply final reduction (mean vs sum) after all workgroups complete
 }

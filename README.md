@@ -8,6 +8,7 @@ A high-performance, memory-efficient neural network library powered by WebGPU.
 
 ### Key Features
 - **WebGPU Accelerated**: All computations (forward pass, backpropagation, genetic evaluation) run on the GPU.
+- **CNN Support**: Includes optimized kernels for 2D Convolution and Max Pooling.
 - **Memory Efficient**: Uses manual buffer swapping (ping-ponging) instead of high-level tensor abstractions to minimize memory overhead and data transfers.
 - **Flexible Training**: Supports both standard backpropagation (SGD) and highly parallelized Genetic Algorithm (GA) evaluation.
 - **Direct Shader Control**: Built on top of `simple-compute-shaders` for direct WGSL control.
@@ -29,21 +30,41 @@ npm install scs-neural
 
 ### 1. Initialization
 
-Define your network architecture and initialize it with WebGPU.
+Define your network architecture using the `layers` configuration.
 
+#### Simple FFNN (Feed-Forward Neural Network)
 ```typescript
-import { NeuralNetwork, ActivationType } from "scs-neural";
+import { NeuralNetwork, ActivationType, LayerType } from "scs-neural";
 
 const nn = new NeuralNetwork({
-    layerSizes: [3, 12, 12, 3], // Input, Hidden Layers, Output
+    layers: [
+        { type: LayerType.INPUT, shape: [3] },
+        { type: LayerType.DENSE, size: 12 },
+        { type: LayerType.DENSE, size: 3 },
+    ],
     trainingBatchSize: 10,
     testingBatchSize: 1,
     hiddenActivationType: ActivationType.RELU,
     outputActivationType: ActivationType.LINEAR,
 });
 
-// Initialize with a weight initialization method
-await nn.initialize("xavier"); // Options: 'xavier', 'he', 'uniform', 'zero'
+await nn.initialize("xavier");
+```
+
+#### CNN (Convolutional Neural Network)
+```typescript
+const nn = new NeuralNetwork({
+    layers: [
+        { type: LayerType.INPUT, shape: [28, 28, 1] }, // 28x28 grayscale image
+        { type: LayerType.CONV2D, kernelSize: 3, filters: 16, activation: ActivationType.RELU },
+        { type: LayerType.MAXPOOL2D, poolSize: 2 },
+        { type: LayerType.FLATTEN },
+        { type: LayerType.DENSE, size: 10 }, // Output layer for 10 classes
+    ],
+    trainingBatchSize: 32,
+});
+
+await nn.initialize("he");
 ```
 
 ### 2. Forward Pass (Inference)
@@ -51,7 +72,7 @@ await nn.initialize("xavier"); // Options: 'xavier', 'he', 'uniform', 'zero'
 Run a single inference pass. The library handles the internal ping-ponging of buffers.
 
 ```typescript
-const input = new Float32Array([0.5, 0.2, 0.8]);
+const input = new Float32Array([...]); // Flat array matching input shape
 const output = await nn.forwardPass(input);
 console.log("Network Output:", output);
 ```
@@ -62,10 +83,10 @@ Train the network using supervised learning. The `train` method handles batching
 
 ```typescript
 await nn.train({
-    inputActivations: [new Float32Array([0, 0, 0]), ...],
-    targetActivations: [new Float32Array([1, 1, 1]), ...],
-    epochs: 1000,
-    learningRate: 0.01,
+    inputActivations: [...], // Array of Float32Arrays
+    targetActivations: [...],
+    epochs: 10,
+    learningRate: 0.001,
     progressCallback: (epoch, loss) => {
         console.log(`Epoch ${epoch} - Loss: ${loss}`);
     }
@@ -74,17 +95,16 @@ await nn.train({
 
 ### 4. Genetic Algorithms (Parallel Evaluation)
 
-`scs-neural` excels at evaluating large populations in parallel, which is ideal for reinforcement learning or neuroevolution. This happens in a single GPU dispatch.
+`scs-neural` excels at evaluating large populations in parallel, which is ideal for reinforcement learning or neuroevolution.
 
 ```typescript
-const { activations, losses } = await nn.evaluatePopulation({
+const { activations } = await nn.evaluatePopulation({
     populationSize: 100,
     batchSize: 1,
-    weights: populationWeights, // [layerIndex][genomeIndex]
-    biases: populationBiases,   // [layerIndex][genomeIndex]
-    inputs: populationInputs,   // [genomeIndex]
-    returnActivations: true,
-    returnLoss: false
+    weights: populationWeights,
+    biases: populationBiases,
+    inputs: populationInputs,
+    returnActivations: true
 });
 ```
 
@@ -108,7 +128,7 @@ Then open the URL provided by Vite.
 
 The core library is located in `src/`.
 
-- **Shaders**: Located in `src/shaders/`, these WGSL files handle the core mathematical operations.
+- **Shaders**: Located in `src/shaders/`, these WGSL files handle the core mathematical operations including Conv2D and MaxPool.
 - **Buffer Management**: The library maintains dedicated `StorageBuffer` objects for weights, biases, gradients, and activations for every layer to avoid runtime allocations and garbage collection overhead.
 
 ## 📄 License

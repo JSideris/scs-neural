@@ -1,4 +1,4 @@
-import { NeuralNetwork, ActivationType } from "../../src";
+import { NeuralNetwork, ActivationType, LayerType } from "../../src";
 import FlappyBirdGame from "./flappy-bird";
 
 interface Genome {
@@ -15,7 +15,12 @@ async function start() {
 	
 	// Create neural network for evaluation
 	const neuralNetwork = new NeuralNetwork({
-		layerSizes: [INPUT_SIZE, 8, 8, OUTPUT_SIZE],
+		layers: [
+			{ type: LayerType.INPUT, shape: [INPUT_SIZE] },
+			{ type: LayerType.DENSE, size: 8 },
+			{ type: LayerType.DENSE, size: 8 },
+			{ type: LayerType.DENSE, size: OUTPUT_SIZE },
+		],
 		trainingBatchSize: 1,
 		testingBatchSize: 1,
 		outputActivationType: ActivationType.LINEAR,
@@ -23,7 +28,7 @@ async function start() {
 	
 	try {
 		await neuralNetwork.initialize("xavier");
-	} catch (error) {
+	} catch (error: any) {
 		console.error("WebGPU Initialization Failed:", error);
 		const errorDiv = document.createElement("div");
 		errorDiv.style.color = "red";
@@ -44,12 +49,12 @@ async function start() {
 	// Initialize population
 	let population: Genome[] = [];
 	for (let i = 0; i < POPULATION_SIZE; i++) {
-		population.push(createRandomGenome(neuralNetwork.layerSizes));
+		population.push(createRandomGenome(neuralNetwork));
 	}
 
 	let generation = 0;
 	let bestFitnessEver = 0;
-	let bestGenomeEver: Genome = null;
+	let bestGenomeEver: Genome | null = null;
 
 	// Create game visualization
 	const game = new FlappyBirdGame(POPULATION_SIZE);
@@ -94,16 +99,13 @@ async function start() {
 			if (aliveIndices.length === 0) break;
 
 			// Prepare weights and biases for alive birds
-			const numLayers = neuralNetwork.layerSizes.length;
+			const numLayers = neuralNetwork.layers.length;
 			const weights: Float32Array[][] = new Array(numLayers);
 			const biases: Float32Array[][] = new Array(numLayers);
 			
-			weights[0] = [];
-			biases[0] = [];
-			
-			for (let layer = 1; layer < numLayers; layer++) {
-				weights[layer] = aliveIndices.map(idx => population[idx].weights[layer]);
-				biases[layer] = aliveIndices.map(idx => population[idx].biases[layer]);
+			for (let i = 1; i < numLayers; i++) {
+				weights[i] = aliveIndices.map(idx => population[idx].weights[i]);
+				biases[i] = aliveIndices.map(idx => population[idx].biases[i]);
 			}
 
 			// Evaluate all alive birds in parallel
@@ -119,7 +121,7 @@ async function start() {
 			// Apply outputs and update game
 			for (let i = 0; i < aliveIndices.length; i++) {
 				const birdIndex = aliveIndices[i];
-				const output = activations[i]; // Single output value
+				const output = activations![i]; // Single output value
 				
 				// If output > 0.5, flap
 				if (output > 0.5) {
@@ -168,7 +170,7 @@ async function start() {
 		console.log(`Generation ${generation}: Best=${generationBest.fitness.toFixed(1)}, AllTime=${bestFitnessEver.toFixed(1)}`);
 
 		// Evolve population
-		population = evolvePopulation(population, neuralNetwork.layerSizes);
+		population = evolvePopulation(population, neuralNetwork);
 
 		// Continue to next generation
 		setTimeout(runGeneration, 100);
@@ -177,18 +179,19 @@ async function start() {
 	runGeneration();
 }
 
-function createRandomGenome(layerSizes: number[]): Genome {
-	const weights: Float32Array[] = [null]; // No weights for input layer
-	const biases: Float32Array[] = [null];  // No biases for input layer
+function createRandomGenome(nn: NeuralNetwork): Genome {
+	const weights: Float32Array[] = [null as any]; 
+	const biases: Float32Array[] = [null as any]; 
 
-	for (let i = 1; i < layerSizes.length; i++) {
-		const inputSize = layerSizes[i - 1];
-		const outputSize = layerSizes[i];
+	for (let i = 1; i < nn.layers.length; i++) {
+		const layer = nn.layers[i];
+        const prevLayer = nn.layers[i-1];
 		
 		// Xavier initialization
-		const scale = Math.sqrt(2.0 / inputSize);
-		const w = new Float32Array(inputSize * outputSize);
-		const b = new Float32Array(outputSize);
+		const scale = Math.sqrt(2.0 / prevLayer.size);
+        const totalWeights = prevLayer.size * layer.size;
+		const w = new Float32Array(totalWeights);
+		const b = new Float32Array(layer.size);
 		
 		for (let j = 0; j < w.length; j++) {
 			w[j] = (Math.random() * 2 - 1) * scale;
@@ -206,14 +209,14 @@ function createRandomGenome(layerSizes: number[]): Genome {
 
 function cloneGenome(genome: Genome): Genome {
 	return {
-		weights: genome.weights.map(w => w ? new Float32Array(w) : null),
-		biases: genome.biases.map(b => b ? new Float32Array(b) : null),
+		weights: genome.weights.map(w => w ? new Float32Array(w) : null as any),
+		biases: genome.biases.map(b => b ? new Float32Array(b) : null as any),
 		fitness: genome.fitness,
 		isAlive: genome.isAlive,
 	};
 }
 
-function evolvePopulation(population: Genome[], layerSizes: number[]): Genome[] {
+function evolvePopulation(population: Genome[], nn: NeuralNetwork): Genome[] {
 	// Sort by fitness
 	const sorted = [...population].sort((a, b) => b.fitness - a.fitness);
 	

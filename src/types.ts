@@ -6,12 +6,62 @@ export enum ActivationType {
   SOFTMAX = 4,
 }
 
+export enum LayerType {
+  INPUT = "input",
+  DENSE = "dense",
+  CONV2D = "conv2d",
+  MAXPOOL2D = "maxpool2d",
+  FLATTEN = "flatten",
+}
+
+export interface BaseLayerConfig {
+  type: LayerType;
+}
+
+export interface InputLayerConfig extends BaseLayerConfig {
+  type: LayerType.INPUT;
+  shape: number[]; // e.g., [width, height, channels] or [size]
+}
+
+export interface DenseLayerConfig extends BaseLayerConfig {
+  type: LayerType.DENSE;
+  size: number;
+  activation?: ActivationType;
+}
+
+export interface Conv2DLayerConfig extends BaseLayerConfig {
+  type: LayerType.CONV2D;
+  kernelSize: number;
+  filters: number;
+  stride?: number;
+  padding?: number;
+  activation?: ActivationType;
+}
+
+export interface MaxPool2DLayerConfig extends BaseLayerConfig {
+  type: LayerType.MAXPOOL2D;
+  poolSize: number;
+  stride?: number;
+}
+
+export interface FlattenLayerConfig extends BaseLayerConfig {
+  type: LayerType.FLATTEN;
+}
+
+export type LayerConfig =
+  | InputLayerConfig
+  | DenseLayerConfig
+  | Conv2DLayerConfig
+  | MaxPool2DLayerConfig
+  | FlattenLayerConfig;
+
 export interface NeuralNetworkOptions {
-  layerSizes: number[];
+  layers?: LayerConfig[];
+  layerSizes?: number[]; // Deprecated but kept for backward compatibility
   trainingBatchSize?: number;
   testingBatchSize?: number;
-  hiddenActivationType?: ActivationType;
-  outputActivationType?: ActivationType;
+  hiddenActivationType?: ActivationType; // Default for dense/conv if not specified
+  outputActivationType?: ActivationType; // Default for last layer if not specified
 }
 
 export interface TrainOptions {
@@ -27,10 +77,10 @@ export interface TrainOptions {
 export interface EvaluatePopulationOptions {
   populationSize: number;
   batchSize: number;
-  weights: Float32Array[][]; // [layerIndex>0][genomeIndex] length input_size*output_size
-  biases: Float32Array[][];  // [layerIndex>0][genomeIndex] length output_size
-  inputs: Float32Array[];    // [genomeIndex] length batchSize*inputSize
-  targets?: Float32Array[];   // [genomeIndex] length batchSize*outputSize (required for loss)
+  weights: Float32Array[][]; // [layerIndex>0][genomeIndex]
+  biases: Float32Array[][];  // [layerIndex>0][genomeIndex]
+  inputs: Float32Array[];    // [genomeIndex]
+  targets?: Float32Array[];   // [genomeIndex]
   returnActivations?: boolean;
   returnLoss?: boolean;
 }
