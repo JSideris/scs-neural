@@ -65,6 +65,69 @@ export class GameRenderer {
     }
   }
 
+  private drawFood(ctx: CanvasRenderingContext2D, x: number, y: number, px: number, py: number, tileSize: number) {
+    const seed = ((x * 123 + y * 456) % 1000) / 1000;
+    const cx = px + tileSize / 2;
+    const cy = py + tileSize / 2;
+
+    const pseudoRandom = (offset: number) => {
+      const s = Math.sin(seed * 1000 + offset) * 10000;
+      return s - Math.floor(s);
+    };
+
+    // Tasty food colors: range of greens, limes, and yellows
+    const hue = 60 + pseudoRandom(1) * 60; // 60 (yellow) to 120 (green)
+    const baseColor = `hsl(${hue}, 80%, 45%)`;
+    const highlightColor = `hsl(${hue}, 90%, 70%)`;
+    const shadowColor = `hsl(${hue}, 70%, 25%)`;
+
+    const radius = tileSize * 0.3;
+
+    // Draw shadow
+    ctx.fillStyle = shadowColor;
+    ctx.beginPath();
+    ctx.arc(cx + 0.5, cy + 0.5, radius, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Draw body
+    ctx.fillStyle = baseColor;
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Draw highlight glint
+    ctx.fillStyle = highlightColor;
+    ctx.beginPath();
+    ctx.arc(cx - radius * 0.3, cy - radius * 0.3, radius * 0.3, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  private drawDirt(ctx: CanvasRenderingContext2D, x: number, y: number, px: number, py: number, tileSize: number) {
+    const seed = ((x * 31 + y * 17) % 1000) / 1000;
+    
+    const pseudoRandom = (offset: number) => {
+      const s = Math.sin(seed * 1000 + offset) * 10000;
+      return s - Math.floor(s);
+    };
+
+    // Base dirt color
+    ctx.fillStyle = '#3e2723';
+    ctx.fillRect(px, py, tileSize, tileSize);
+
+    // Add some grains for texture
+    const numGrains = 2 + Math.floor(pseudoRandom(1) * 2); // 2-3 grains
+    for (let i = 0; i < numGrains; i++) {
+      const gx = px + pseudoRandom(i + 2) * (tileSize - 1);
+      const gy = py + pseudoRandom(i + 5) * (tileSize - 1);
+      const gw = 1 + Math.floor(pseudoRandom(i + 8) * 1.5); // 1-2px wide
+      const gh = 1;
+      
+      // Alternate between highlight and shadow grains
+      ctx.fillStyle = i % 2 === 0 ? '#4e342e' : '#2e1b17';
+      ctx.fillRect(gx, gy, gw, gh);
+    }
+  }
+
   private drawAnt(ctx: CanvasRenderingContext2D, ant: Ant, px: number, py: number, tileSize: number) {
     const cx = px + tileSize / 2;
     const cy = py + tileSize / 2;
@@ -128,10 +191,28 @@ export class GameRenderer {
 
     // 6. Food Carried
     if (ant.foodCarried > 0) {
-        ctx.fillStyle = '#4caf50';
+        const foodHue = 60 + (ant.id % 0.5) * 120; // Some variation based on ant id
+        const foodBaseColor = `hsl(${foodHue}, 80%, 45%)`;
+        const foodHighlightColor = `hsl(${foodHue}, 90%, 70%)`;
+        
+        ctx.fillStyle = foodBaseColor;
         ctx.beginPath();
-        ctx.arc(5, 0, 1.2, 0, Math.PI * 2);
+        ctx.arc(5, 0, 1.5, 0, Math.PI * 2);
         ctx.fill();
+
+        // Small highlight on carried food
+        ctx.fillStyle = foodHighlightColor;
+        ctx.beginPath();
+        ctx.arc(4.5, -0.5, 0.5, 0, Math.PI * 2);
+        ctx.fill();
+
+        // If carrying multiple food items, show a stack or bigger cluster
+        if (ant.foodCarried > 1) {
+            ctx.fillStyle = foodBaseColor;
+            ctx.beginPath();
+            ctx.arc(6.5, 0, 1.2, 0, Math.PI * 2);
+            ctx.fill();
+        }
     }
 
     ctx.restore();
@@ -149,12 +230,10 @@ export class GameRenderer {
 
         switch (type) {
           case TileType.DIRT:
-            ctx.fillStyle = '#3e2723';
-            ctx.fillRect(px, py, tileSize, tileSize);
+            this.drawDirt(ctx, x, y, px, py, tileSize);
             break;
           case TileType.FOOD:
-            ctx.fillStyle = '#4caf50';
-            ctx.fillRect(px + 2, py + 2, tileSize - 4, tileSize - 4);
+            this.drawFood(ctx, x, y, px, py, tileSize);
             break;
           case TileType.ROCK:
             const rock = game.rocks.get(`${x},${y}`) || { x, y, damage: 0, seed: (x * 7 + y * 13) % 100 / 100 };

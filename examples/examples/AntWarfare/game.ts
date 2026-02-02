@@ -27,6 +27,7 @@ export interface Ant {
   kills: number;
   totalDamageDealt: number;
   foodCollected: number;
+  foodReturnedHome: number;
   distanceTravelled: number;
   outOfBoundsAttempts: number;
   directionsAttempted: { up: boolean, down: boolean, left: boolean, right: boolean };
@@ -127,9 +128,13 @@ export class AntWarfareGame {
     }
 
     // Initial Food
-    for (let i = 0; i < 50; i++) {
-      this.spawnFood();
+    for (let i = 0; i < 40; i++) {
+      this.spawnFood(1);
     }
+    for (let i = 0; i < 5; i++) {
+      this.spawnFood(2);
+    }
+    this.spawnFood(4);
 
     // Initial Eggs
     this.spawnInitialEggs(Colony.RED);
@@ -166,11 +171,32 @@ export class AntWarfareGame {
     }
   }
 
-  private spawnFood() {
-    const x = Math.floor(Math.random() * this.width);
-    const y = Math.floor(Math.random() * this.height);
-    if (this.grid[y][x] === TileType.DIRT) {
-      this.grid[y][x] = TileType.FOOD;
+  private spawnFood(size: number = 1) {
+    const startX = Math.floor(Math.random() * (this.width - size + 1));
+    const startY = Math.floor(Math.random() * (this.height - size + 1));
+
+    // Check if entire area is clear (DIRT)
+    let canPlace = true;
+    for (let dy = 0; dy < size; dy++) {
+      for (let dx = 0; dx < size; dx++) {
+        if (this.grid[startY + dy][startX + dx] !== TileType.DIRT) {
+          canPlace = false;
+          break;
+        }
+      }
+      if (!canPlace) break;
+    }
+
+    if (canPlace) {
+      for (let dy = 0; dy < size; dy++) {
+        for (let dx = 0; dx < size; dx++) {
+          this.grid[startY + dy][startX + dx] = TileType.FOOD;
+        }
+      }
+    } else if (size === 1) {
+      // Fallback for 1x1 if the random spot was taken (original behavior)
+      // but maybe just let it fail for simplicity or try again.
+      // Original code didn't try again.
     }
   }
 
@@ -196,7 +222,10 @@ export class AntWarfareGame {
         }
       }
       if (foodCount < this.MAX_FOOD_ON_MAP) {
-        this.spawnFood();
+        const rand = Math.random();
+        if (rand < 0.05) this.spawnFood(4);      // Very rare 4x4
+        else if (rand < 0.2) this.spawnFood(2);  // Occasional 2x2
+        else this.spawnFood(1);                  // Regular 1x1
       }
     }
 
@@ -287,6 +316,7 @@ export class AntWarfareGame {
                   if (ant.foodCarried > 0) {
                     this.hatchEgg(eggIndex);
                     ant.foodCarried--;
+                    ant.foodReturnedHome++;
                   }
                 } else {
                   // Steal enemy egg
@@ -369,6 +399,7 @@ export class AntWarfareGame {
                 // Every 3 food = 1 egg
                 // For simplicity, we can track "queen food" or just use a counter
                 this.feedQueen(ant.colony, ant.foodCarried);
+                ant.foodReturnedHome += ant.foodCarried;
                 ant.foodCarried = 0;
             }
           }
@@ -528,6 +559,7 @@ export class AntWarfareGame {
       kills: 0,
       totalDamageDealt: 0,
       foodCollected: 0,
+      foodReturnedHome: 0,
       distanceTravelled: 0,
       outOfBoundsAttempts: 0,
       directionsAttempted: { up: false, down: false, left: false, right: false },
@@ -549,7 +581,7 @@ export class AntWarfareGame {
   public onAntHatched?: (ant: Ant) => void;
   
   public getFitnessScore(ant: Ant): number {
-    let score = (ant.kills * 100) + (ant.foodCollected * 20);
+    let score = (ant.kills * 100) + (ant.foodReturnedHome * 100) + (ant.foodCollected * 20);
     
     // Only penalize out-of-bounds attempts if no food has been collected yet.
     // This allows for early exploration without immediate discouragement.
