@@ -56,6 +56,6 @@
     "react-chartjs-2": "^5.3.1",
     "react-dom": "^19.2.4",
     "react-router-dom": "^7.13.0",
-    "simple-compute-shaders": "^0.3.0"
+    "simple-compute-shaders": "^0.3.1"
   }
 }

@@ -168,6 +168,14 @@ export default class NeuralNetwork {
           const padding = config.padding ?? 0;
           const outH = Math.floor((h + 2 * padding - config.kernelSize) / stride) + 1;
           const outW = Math.floor((w + 2 * padding - config.kernelSize) / stride) + 1;
+
+          if (outH < 1 || outW < 1) {
+            throw new Error(
+              `Conv2D layer output dimensions [${outH}, ${outW}] are invalid for layer ${i}. ` +
+              `Ensure input dimensions [${h}, ${w}] are large enough for kernelSize ${config.kernelSize} with padding ${padding} and stride ${stride}.`
+            );
+          }
+
           nextShape = [outH, outW, config.filters];
           break;
         }
@@ -176,6 +184,14 @@ export default class NeuralNetwork {
           const stride = config.stride ?? config.poolSize;
           const outH = Math.floor((h - config.poolSize) / stride) + 1;
           const outW = Math.floor((w - config.poolSize) / stride) + 1;
+
+          if (outH < 1 || outW < 1) {
+            throw new Error(
+              `MaxPool2D layer output dimensions [${outH}, ${outW}] are invalid for layer ${i}. ` +
+              `Ensure input dimensions [${h}, ${w}] are large enough for poolSize ${config.poolSize} and stride ${stride}.`
+            );
+          }
+
           nextShape = [outH, outW, c];
           break;
         }
