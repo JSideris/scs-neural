@@ -69,6 +69,7 @@ export const AntWarfare: React.FC = () => {
   const blackHallOfFameRef = useRef<Genome[]>([]);
   const bestRedGenomeRef = useRef<Genome | null>(null);
   const bestBlackGenomeRef = useRef<Genome | null>(null);
+  const lastScrambleFrameRef = useRef<{ [key in Colony]: number }>({ [Colony.RED]: 0, [Colony.BLACK]: 0 });
   
   const MAX_HOF_SIZE = 10;
   
@@ -95,7 +96,7 @@ export const AntWarfare: React.FC = () => {
   const initializingRef = useRef(false);
   const isRunningRef = useRef(false);
 
-  const INPUT_SHAPE = [7, 7, 15]; // (7*7 grid with 15 channels)
+  const INPUT_SHAPE = [7, 7, 21]; // (7*7 grid with 21 channels)
   const OUTPUT_SIZE = 9; // Move(5), Drop(1), Attack(1), Phero0(1), Phero1(1)
 
   useEffect(() => {
@@ -249,6 +250,72 @@ export const AntWarfare: React.FC = () => {
     return { weights, biases, id: newId };
   };
 
+  const scrambleColony = (colony: Colony) => {
+    if (!gameRef.current) return;
+    
+    // Clear Hall of Fame for this colony
+    if (colony === Colony.RED) {
+      redHallOfFameRef.current = [];
+      bestRedGenomeRef.current = null;
+    } else {
+      blackHallOfFameRef.current = [];
+      bestBlackGenomeRef.current = null;
+    }
+
+    // Generate new random genomes for all living ants in this colony
+    const genomes = colony === Colony.RED ? redGenomesRef.current : blackGenomesRef.current;
+    const livingAnts = gameRef.current.ants.filter(a => a.colony === colony && !a.isDead);
+    
+    livingAnts.forEach(ant => {
+      genomes.set(ant.id, createRandomGenome(ant.id));
+      // Reset attempted directions to give them a clean slate for the next stagnation check
+      ant.directionsAttempted = { up: false, down: false, left: false, right: false };
+      ant.outOfBoundsAttempts = 0;
+    });
+
+    lastScrambleFrameRef.current[colony] = game.frameCount;
+    // Reset the last food frame so they have a full window to find food with their new brains
+    game.lastFoodFrame[colony] = game.frameCount;
+    
+    showStatus(`${colony === Colony.RED ? 'Red' : 'Black'} colony scrambled due to stagnation!`);
+  };
+
+  const checkStagnation = () => {
+    if (!gameRef.current) return;
+    const game = gameRef.current;
+    
+    // Wait at least 2000 frames from game start
+    if (game.frameCount < 2000) return;
+
+    [Colony.RED, Colony.BLACK].forEach(colony => {
+      const framesSinceFood = game.frameCount - game.lastFoodFrame[colony];
+      const framesSinceScramble = game.frameCount - lastScrambleFrameRef.current[colony];
+      
+      // Criteria: 
+      // 1. 1500+ frames since last food
+      // 2. Ensure at least 1000 frames since last scramble
+      if (framesSinceFood > 1500 && framesSinceScramble > 1000) {
+        const livingAnts = game.ants.filter(a => a.colony === colony && !a.isDead);
+        if (livingAnts.length > 0) {
+          // 3. Average unique directions < 1.5
+          let totalDirections = 0;
+          livingAnts.forEach(ant => {
+            const count = (ant.directionsAttempted.up ? 1 : 0) + 
+                          (ant.directionsAttempted.down ? 1 : 0) + 
+                          (ant.directionsAttempted.left ? 1 : 0) + 
+                          (ant.directionsAttempted.right ? 1 : 0);
+            totalDirections += count;
+          });
+          const avgDirections = totalDirections / livingAnts.length;
+          
+          if (avgDirections < 1.5) {
+            scrambleColony(colony);
+          }
+        }
+      }
+    });
+  };
+
   const runStep = async () => {
     if (!isRunningRef.current || !gameRef.current || !nnRef.current) return;
 
@@ -321,6 +388,7 @@ export const AntWarfare: React.FC = () => {
         }
 
         game.update(decisions);
+        checkStagnation();
         
         // Track best genomes
         aliveAnts.forEach(ant => {
@@ -464,6 +532,7 @@ export const AntWarfare: React.FC = () => {
         blackHallOfFameRef.current = [];
         bestRedGenomeRef.current = null;
         bestBlackGenomeRef.current = null;
+        lastScrambleFrameRef.current = { [Colony.RED]: 0, [Colony.BLACK]: 0 };
         gameRef.current.reset();
         setRedCount(gameRef.current.ants.filter(a => a.colony === Colony.RED && !a.isDead).length);
         setBlackCount(gameRef.current.ants.filter(a => a.colony === Colony.BLACK && !a.isDead).length);

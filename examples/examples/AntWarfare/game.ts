@@ -32,7 +32,10 @@ export interface Ant {
   outOfBoundsAttempts: number;
   directionsAttempted: { up: boolean, down: boolean, left: boolean, right: boolean };
   lastMoveDirection: { dx: number, dy: number };
+  moveHistory: { dx: number, dy: number }[];
   bornOnRock: boolean;
+  maxHealth: number;
+  isGrownUp: boolean;
 }
 
 export interface Egg {
@@ -64,10 +67,14 @@ export class AntWarfareGame {
   public eggs: Egg[];
   public ants: Ant[];
   public frameCount: number = 0;
+  public lastFoodFrame: { [key in Colony]: number } = { [Colony.RED]: 0, [Colony.BLACK]: 0 };
 
   private readonly MAX_ANTS_PER_COLONY = 50;
   private readonly MAX_FOOD_ON_MAP = 100;
   private readonly STARVE_RATE = 0.1;
+  private readonly HEAL_RATE = 0.05;
+  private readonly HUNGER_THRESHOLD_FOR_HEALING = 80;
+  private readonly GROW_UP_FOOD_THRESHOLD = 10;
   private readonly MOVE_HUNGER_COST = 0.5;
   private readonly STAY_HUNGER_COST = 0.1;
   private readonly ATTACK_HUNGER_COST = 1.0;
@@ -112,6 +119,7 @@ export class AntWarfareGame {
     this.rocks.clear();
     this.eggs = [];
     this.ants = [];
+    this.lastFoodFrame = { [Colony.RED]: 0, [Colony.BLACK]: 0 };
 
     // Place Queens
     this.placeQueen(Colony.RED, this.QUEEN_POSITIONS[Colony.RED].x, this.QUEEN_POSITIONS[Colony.RED].y);
@@ -248,10 +256,24 @@ export class AntWarfareGame {
       const decision = antDecisions.get(ant.id) || { move: 0, attack: false, dropFood: false, pheromones: [] };
       
       // Hunger decay
-      ant.hunger -= this.STARVE_RATE;
+      let currentStarveRate = this.STARVE_RATE;
+      if (ant.isGrownUp && ant.health >= ant.maxHealth) {
+        currentStarveRate /= 2;
+      }
+      ant.hunger -= currentStarveRate;
+      
       if (ant.hunger <= 0) {
         ant.hunger = 0;
         ant.health -= 1.0; // Starvation damage
+      } else if (ant.hunger >= this.HUNGER_THRESHOLD_FOR_HEALING && ant.health < ant.maxHealth) {
+        ant.health = Math.min(ant.maxHealth, ant.health + this.HEAL_RATE);
+      }
+
+      // Grow up logic
+      if (!ant.isGrownUp && ant.foodCollected >= this.GROW_UP_FOOD_THRESHOLD) {
+        ant.isGrownUp = true;
+        ant.maxHealth *= 2;
+        ant.health = ant.maxHealth; // Heal on level up
       }
 
       if (ant.health <= 0) {
@@ -287,6 +309,12 @@ export class AntWarfareGame {
       else if (decision.move === 2) { dy = 1; ant.directionsAttempted.down = true; } // Down
       else if (decision.move === 3) { dx = -1; ant.directionsAttempted.left = true; } // Left
       else if (decision.move === 4) { dx = 1; ant.directionsAttempted.right = true; } // Right
+
+      // Update move history
+      ant.moveHistory.push({ dx, dy });
+      if (ant.moveHistory.length > 3) {
+        ant.moveHistory.shift();
+      }
 
       if (dx !== 0 || dy !== 0) {
         const targetX = ant.x + dx;
@@ -496,6 +524,7 @@ export class AntWarfareGame {
 
   private feedQueen(colony: Colony, amount: number) {
     this.queenFoodStorage[colony] += amount;
+    this.lastFoodFrame[colony] = this.frameCount;
     const livingCount = this.ants.filter(a => a.colony === colony && !a.isDead).length;
     const eggCount = this.eggs.filter(e => e.colony === colony).length;
     
@@ -564,7 +593,14 @@ export class AntWarfareGame {
       outOfBoundsAttempts: 0,
       directionsAttempted: { up: false, down: false, left: false, right: false },
       lastMoveDirection: randomDir,
-      bornOnRock: egg.bornOnRock
+      moveHistory: [
+        { dx: randomDir.dx, dy: randomDir.dy },
+        { dx: randomDir.dx, dy: randomDir.dy },
+        { dx: randomDir.dx, dy: randomDir.dy }
+      ],
+      bornOnRock: egg.bornOnRock,
+      maxHealth: AntWarfareGame.MAX_HEALTH,
+      isGrownUp: false
     };
 
     // If there was an ant already there, move them out or replace?
@@ -614,11 +650,11 @@ export class AntWarfareGame {
   public getAntState(ant: Ant) {
     const INPUT_H = 7;
     const INPUT_W = 7;
-    const INPUT_C = 15;
+    const INPUT_C = 21;
     const inputs = new Float32Array(INPUT_H * INPUT_W * INPUT_C);
     
     // Shared scalar values
-    const health = ant.health / AntWarfareGame.MAX_HEALTH;
+    const health = ant.health / ant.maxHealth;
     const hunger = ant.hunger / AntWarfareGame.MAX_HUNGER;
     const foodCarried = ant.foodCarried / 5;
     
@@ -673,6 +709,14 @@ export class AntWarfareGame {
         inputs[baseIdx + 12] = hunger;
         inputs[baseIdx + 13] = foodCarried;
         inputs[baseIdx + 14] = distToQueen;
+
+        // 6 Move History Scalars (15-20)
+        // Store the last 3 moves: (dx1, dy1, dx2, dy2, dx3, dy3)
+        for (let i = 0; i < 3; i++) {
+          const move = ant.moveHistory[i] || { dx: 0, dy: 0 };
+          inputs[baseIdx + 15 + i * 2] = move.dx;
+          inputs[baseIdx + 16 + i * 2] = move.dy;
+        }
       }
     }
 

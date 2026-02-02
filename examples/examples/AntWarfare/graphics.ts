@@ -143,9 +143,14 @@ export class GameRenderer {
     ctx.translate(cx, cy);
     ctx.rotate(angle);
     
+    // Scale for grown-up ants
+    if (ant.isGrownUp) {
+      ctx.scale(1.2, 1.2);
+    }
+    
     // Body color based on health/hunger
     const saturation = Math.floor((ant.hunger / AntWarfareGame.MAX_HUNGER) * 100);
-    const lightness = Math.floor((ant.health / AntWarfareGame.MAX_HEALTH) * 40) + 10;
+    const lightness = Math.floor((ant.health / ant.maxHealth) * 40) + 10;
     const hue = ant.colony === Colony.RED ? 0 : 240;
     const bodyColor = `hsl(${hue}, ${saturation}%, ${lightness}%)`;
     
