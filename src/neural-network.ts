@@ -9,6 +9,7 @@ import updateParametersWgsl from "./shaders/update-parameters.compute.wgsl?raw";
 import forwardPassGeneticWgsl from "./shaders/forward-pass-genetic.compute.wgsl?raw";
 import lossGeneticWgsl from "./shaders/loss-genetic.compute.wgsl?raw";
 import conv2dForwardWgsl from "./shaders/conv2d-forward.compute.wgsl?raw";
+import conv2dForwardGeneticWgsl from "./shaders/conv2d-forward-genetic.compute.wgsl?raw";
 import conv2dBackwardDataWgsl from "./shaders/conv2d-backward-data.compute.wgsl?raw";
 import conv2dBackwardWeightsWgsl from "./shaders/conv2d-backward-weights.compute.wgsl?raw";
 import maxpool2dForwardWgsl from "./shaders/maxpool2d-forward.compute.wgsl?raw";
@@ -42,6 +43,8 @@ export default class NeuralNetwork {
   private conv2dForwardShader!: ComputeShader;
   private maxpool2dForwardShader!: ComputeShader;
   private forwardGeneticShader!: ComputeShader;
+  private conv2dForwardGeneticShader!: ComputeShader;
+  private copyGeneticShader!: ComputeShader;
 
   private lossShader!: ComputeShader;
   private backwardErrorShader!: ComputeShader;
@@ -58,6 +61,7 @@ export default class NeuralNetwork {
 
   private forwardPassParamsBuffer!: StorageBuffer;
   private forwardGeneticParamsBuffer!: StorageBuffer;
+  private geneticConv2dParamsBuffer!: StorageBuffer;
   private lossParamsBuffer!: StorageBuffer;
   private backwardPassParamsBuffer!: StorageBuffer;
   private prepareDeltaParamsBuffer!: StorageBuffer;
@@ -343,6 +347,7 @@ export default class NeuralNetwork {
     });
 
     this.initParamsBuffers();
+    this.initGeneticAssets(1, this.testingBatchSize);
     this.initShaders(maxLayerSize);
 
     this.isInitialized = true;
@@ -356,6 +361,99 @@ export default class NeuralNetwork {
       case "zero": return InitializationMethods.initZero(totalSize);
       default: throw new Error(`Unknown initialization method: ${method}`);
     }
+  }
+
+  private initGeneticAssets(P: number, B: number) {
+    const numLayers = this.layers.length;
+    this.currentGeneticPopulationSize = P;
+    this.currentGeneticBatchSize = B;
+
+    this.geneticWeightsBuffers = new Array(numLayers);
+    this.geneticBiasesBuffers = new Array(numLayers);
+    this.geneticActivationsBuffers = new Array(numLayers);
+
+    this.geneticActivationsBuffers[0] = new StorageBuffer({
+      dataType: "array<f32>",
+      size: P * B * this.inputSize,
+      canCopyDst: true,
+    });
+
+    for (let i = 1; i < numLayers; i++) {
+      const layer = this.layers[i];
+      const prevLayer = this.layers[i - 1];
+
+      if (layer.type === LayerType.DENSE) {
+        const weightSize = prevLayer.size * layer.size;
+        this.geneticWeightsBuffers[i] = new StorageBuffer({
+          dataType: "array<f32>",
+          size: P * weightSize,
+          canCopyDst: true,
+        });
+        this.geneticBiasesBuffers[i] = new StorageBuffer({
+          dataType: "array<f32>",
+          size: P * layer.size,
+          canCopyDst: true,
+        });
+      } else if (layer.type === LayerType.CONV2D) {
+        const config = layer.config as any;
+        const inChannels = prevLayer.shape[2];
+        const weightSize = config.kernelSize * config.kernelSize * inChannels * config.filters;
+        this.geneticWeightsBuffers[i] = new StorageBuffer({
+          dataType: "array<f32>",
+          size: P * weightSize,
+          canCopyDst: true,
+        });
+        this.geneticBiasesBuffers[i] = new StorageBuffer({
+          dataType: "array<f32>",
+          size: P * config.filters,
+          canCopyDst: true,
+        });
+      }
+
+      this.geneticActivationsBuffers[i] = new StorageBuffer({
+        dataType: "array<f32>",
+        size: P * B * layer.size,
+        canCopySrc: true,
+      });
+    }
+
+    const commonShaderProps = {
+      useExecutionCountBuffer: false,
+      useTimeBuffer: false,
+    };
+
+    this.forwardGeneticShader = new ComputeShader({
+      ...commonShaderProps,
+      code: forwardPassGeneticWgsl,
+      workgroupCount: [1, 1, 1],
+      bindingLayouts: [
+        { default: [{ binding: this.forwardGeneticParamsBuffer, name: "params", type: "storage" }] },
+        this.getGeneticWeightsLayout(),
+        this.getGeneticDataLayout(),
+        { default: [] }, // No z-values
+      ],
+    });
+
+    this.conv2dForwardGeneticShader = new ComputeShader({
+      ...commonShaderProps,
+      code: conv2dForwardGeneticWgsl,
+      workgroupCount: [1, 1, 1],
+      bindingLayouts: [
+        { default: [{ binding: this.geneticConv2dParamsBuffer, name: "params", type: "storage" }] },
+        this.getGeneticWeightsLayout(),
+        this.getGeneticDataLayout(),
+      ],
+    });
+
+    this.copyGeneticShader = new ComputeShader({
+      ...commonShaderProps,
+      code: copyWgsl,
+      workgroupCount: [1, 1, 1],
+      bindingLayouts: [
+        { default: [{ binding: this.copyParamsBuffer, name: "params", type: "storage" }] },
+        this.getGeneticCopyLayout(),
+      ],
+    });
   }
 
   private initParamsBuffers() {
@@ -379,6 +477,26 @@ export default class NeuralNetwork {
         { name: "batch_size", dataType: "u32" },
         { name: "input_size", dataType: "u32" },
         { name: "output_size", dataType: "u32" },
+        { name: "activation_type", dataType: "u32" },
+      ],
+      canCopyDst: true,
+    });
+
+    this.geneticConv2dParamsBuffer = new StorageBuffer({
+      dataType: "struct",
+      structName: "GeneticConv2DParams",
+      fields: [
+        { name: "population_size", dataType: "u32" },
+        { name: "batch_size", dataType: "u32" },
+        { name: "input_height", dataType: "u32" },
+        { name: "input_width", dataType: "u32" },
+        { name: "input_channels", dataType: "u32" },
+        { name: "output_height", dataType: "u32" },
+        { name: "output_width", dataType: "u32" },
+        { name: "output_channels", dataType: "u32" },
+        { name: "kernel_size", dataType: "u32" },
+        { name: "stride", dataType: "u32" },
+        { name: "padding", dataType: "u32" },
         { name: "activation_type", dataType: "u32" },
       ],
       canCopyDst: true,
@@ -677,6 +795,42 @@ export default class NeuralNetwork {
   }
 
   // Layout Helpers
+  private getGeneticWeightsLayout() {
+    return this.layers.reduce((obj: any, _, i) => {
+      if (i > 0 && this.geneticWeightsBuffers[i] && this.geneticBiasesBuffers[i]) {
+        obj[`layer_${i}`] = [
+          { binding: this.geneticWeightsBuffers[i], name: "weights", type: "storage" },
+          { binding: this.geneticBiasesBuffers[i], name: "biases", type: "storage" },
+        ];
+      }
+      return obj;
+    }, {});
+  }
+
+  private getGeneticDataLayout() {
+    return this.layers.reduce((obj: any, _, i) => {
+      if (i > 0) {
+        obj[`layer_${i}`] = [
+          { binding: this.geneticActivationsBuffers[i - 1], name: "inputs", type: "storage" },
+          { binding: this.geneticActivationsBuffers[i], name: "activations", type: "storage" },
+        ];
+      }
+      return obj;
+    }, {});
+  }
+
+  private getGeneticCopyLayout() {
+    return this.layers.reduce((obj: any, _, i) => {
+      if (i > 0) {
+        obj[`layer_${i}`] = [
+          { binding: this.geneticActivationsBuffers[i - 1], name: "input_data", type: "storage" },
+          { binding: this.geneticActivationsBuffers[i], name: "output_data", type: "storage" },
+        ];
+      }
+      return obj;
+    }, {});
+  }
+
   private getSoftmaxCombinedLayout() {
     const layout: any = {
       default: [
@@ -1278,72 +1432,7 @@ export default class NeuralNetwork {
     const needsReinit = P !== this.currentGeneticPopulationSize || B !== this.currentGeneticBatchSize;
 
     if (needsReinit) {
-      this.currentGeneticPopulationSize = P;
-      this.currentGeneticBatchSize = B;
-
-      // Dispose old buffers if needed (simple-compute-shaders might need explicit disposal, but let's assume GC for now)
-      this.geneticWeightsBuffers = new Array(numLayers);
-      this.geneticBiasesBuffers = new Array(numLayers);
-      this.geneticActivationsBuffers = new Array(numLayers);
-
-      this.geneticActivationsBuffers[0] = new StorageBuffer({
-        dataType: "array<f32>",
-        size: P * B * this.inputSize,
-        canCopyDst: true,
-      });
-
-      for (let i = 1; i < numLayers; i++) {
-        const layer = this.layers[i];
-        const prevLayer = this.layers[i - 1];
-
-        if (layer.type === LayerType.DENSE) {
-          const weightSize = prevLayer.size * layer.size;
-          this.geneticWeightsBuffers[i] = new StorageBuffer({
-            dataType: "array<f32>",
-            size: P * weightSize,
-            canCopyDst: true,
-          });
-          this.geneticBiasesBuffers[i] = new StorageBuffer({
-            dataType: "array<f32>",
-            size: P * layer.size,
-            canCopyDst: true,
-          });
-          this.geneticActivationsBuffers[i] = new StorageBuffer({
-            dataType: "array<f32>",
-            size: P * B * layer.size,
-            canCopySrc: true,
-          });
-        } else {
-          throw new Error(`Genetic evaluation not yet implemented for layer type: ${layer.type}`);
-        }
-      }
-
-      this.forwardGeneticShader = new ComputeShader({
-        useExecutionCountBuffer: false,
-        useTimeBuffer: false,
-        code: forwardPassGeneticWgsl,
-        workgroupCount: [1024, 1], // Placeholder
-        bindingLayouts: [
-          { default: [{ binding: this.forwardGeneticParamsBuffer, name: "params", type: "storage" }] },
-          this.geneticWeightsBuffers.reduce((obj: any, _, i) => {
-            if (i > 0)
-              obj[`layer_${i}`] = [
-                { binding: this.geneticWeightsBuffers[i], name: "weights", type: "storage" },
-                { binding: this.geneticBiasesBuffers[i], name: "biases", type: "storage" },
-              ];
-            return obj;
-          }, {}),
-          this.geneticActivationsBuffers.reduce((obj: any, _, i) => {
-            if (i > 0)
-              obj[`layer_${i}`] = [
-                { binding: this.geneticActivationsBuffers[i - 1], name: "inputs", type: "storage" },
-                { binding: this.geneticActivationsBuffers[i], name: "activations", type: "storage" },
-              ];
-            return obj;
-          }, {}),
-          { default: [] }, // No z-values
-        ],
-      });
+      this.initGeneticAssets(P, B);
     }
 
     // Pack and write data to buffers
@@ -1367,10 +1456,20 @@ export default class NeuralNetwork {
         }
         await this.geneticWeightsBuffers[i].write(packedWeights);
         await this.geneticBiasesBuffers[i].write(packedBiases);
+      } else if (layer.type === LayerType.CONV2D) {
+        const config = layer.config as any;
+        const inChannels = prevLayer.shape[2];
+        const weightSize = config.kernelSize * config.kernelSize * inChannels * config.filters;
+        const packedWeights = new Float32Array(P * weightSize);
+        const packedBiases = new Float32Array(P * config.filters);
+        for (let g = 0; g < P; g++) {
+          packedWeights.set(props.weights[i][g], g * weightSize);
+          packedBiases.set(props.biases[i][g], g * config.filters);
+        }
+        await this.geneticWeightsBuffers[i].write(packedWeights);
+        await this.geneticBiasesBuffers[i].write(packedBiases);
       }
     }
-
-    const maxLayerSize = Math.max(...this.layers.map((l) => l.size));
 
     for (let i = 1; i < numLayers; i++) {
       const layer = this.layers[i];
@@ -1378,18 +1477,35 @@ export default class NeuralNetwork {
       const activationType =
         i === numLayers - 1 ? this.outputActivationType : (layer.config as any).activation ?? this.hiddenActivationType;
 
-      await this.forwardGeneticParamsBuffer.write(new Uint32Array([P, B, prevLayer.size, layer.size, activationType]));
-
-      // Dynamic workgroup count for Genetic Forward Pass
-      const totalOutputs = P * B * layer.size;
-      this.forwardGeneticShader.props.workgroupCount = [Math.ceil(totalOutputs / 64), 1, 1];
-
-      this.forwardGeneticShader.dispatch({
-        bindGroups: {
-          1: `layer_${i}`,
-          2: `layer_${i}`,
-        },
-      });
+      if (layer.type === LayerType.DENSE) {
+        await this.forwardGeneticParamsBuffer.write(new Uint32Array([P, B, prevLayer.size, layer.size, activationType]));
+        const totalOutputs = P * B * layer.size;
+        this.forwardGeneticShader.props.workgroupCount = [Math.ceil(totalOutputs / 64), 1, 1];
+        this.forwardGeneticShader.dispatch({ bindGroups: { 1: `layer_${i}`, 2: `layer_${i}` } });
+      } else if (layer.type === LayerType.CONV2D) {
+        const c = layer.config as any;
+        const [inH, inW, inC] = prevLayer.shape;
+        const [outH, outW, outC] = layer.shape;
+        await this.geneticConv2dParamsBuffer.write(new Uint32Array([
+          P, B, inH, inW, inC, outH, outW, outC, c.kernelSize, c.stride ?? 1, c.padding ?? 0, activationType
+        ]));
+        this.conv2dForwardGeneticShader.props.workgroupCount = [
+          Math.ceil(outW / 16),
+          Math.ceil(outH / 16),
+          P * B * outC
+        ];
+        this.conv2dForwardGeneticShader.dispatch({ bindGroups: { 1: `layer_${i}`, 2: `layer_${i}` } });
+      } else if (layer.type === LayerType.FLATTEN) {
+        const size = P * B * layer.size;
+        this.copyParamsBuffer.write(new Uint32Array([size]));
+        this.copyGeneticShader.props.workgroupCount = [Math.ceil(size / 64), 1, 1];
+        
+        this.copyGeneticShader.dispatch({
+            bindGroups: {
+                1: `layer_${i}`
+            }
+        });
+      }
     }
 
     let activations: Float32Array | null = null;
