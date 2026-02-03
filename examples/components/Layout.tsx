@@ -1,5 +1,5 @@
 import React from 'react';
-import { Activity, Bird, Shapes, Github } from 'lucide-react';
+import { Activity, Bird, Shapes, Github, Bug, Pipette } from 'lucide-react';
 import { NavLink } from 'react-router-dom';
 
 interface LayoutProps {
@@ -7,10 +7,10 @@ interface LayoutProps {
 }
 
 const EXAMPLES = [
-  { id: 'color-picker', name: 'Color Inverter', icon: <Activity size={20} />, description: 'Dense network with backpropagation' },
+  { id: 'color-picker', name: 'Color Inverter', icon: <Pipette size={20} />, description: 'Dense network with backpropagation' },
   { id: 'flappy-bird', name: 'Flappy Bird', icon: <Bird size={20} />, description: 'Genetic algorithm evolution' },
   { id: 'shape-classifier', name: 'Shape Classifier', icon: <Shapes size={20} />, description: 'CNN for image recognition' },
-  { id: 'ant-warfare', name: 'Ant Warfare', icon: <Activity size={20} />, description: 'Continuous convolutional genetic evolution' },
+  { id: 'ant-warfare', name: 'Ant Warfare', icon: <Bug size={20} />, description: 'Continuous convolutional genetic evolution' },
 ];
 
 export const Layout: React.FC<LayoutProps> = ({ children }) => {

@@ -9,8 +9,9 @@ A high-performance, memory-efficient neural network library powered by WebGPU.
 ### Key Features
 - **WebGPU Accelerated**: All computations (forward pass, backpropagation, genetic evaluation) run on the GPU.
 - **CNN Support**: Includes optimized kernels for 2D Convolution and Max Pooling.
+- **Neuroevolution for CNNs**: Highly parallelized Genetic Algorithm (GA) evaluation supporting Dense, Conv2D, and Flatten layers.
 - **Memory Efficient**: Uses manual buffer swapping (ping-ponging) instead of high-level tensor abstractions to minimize memory overhead and data transfers.
-- **Flexible Training**: Supports both standard backpropagation (SGD) and highly parallelized Genetic Algorithm (GA) evaluation.
+- **Flexible Training**: Supports both standard backpropagation (SGD) and large-scale population evaluation.
 - **Direct Shader Control**: Built on top of `simple-compute-shaders` for direct WGSL control.
 
 ## 🛠 Core Philosophy: Performance over DX
@@ -55,17 +56,37 @@ await nn.initialize("xavier");
 ```typescript
 const nn = new NeuralNetwork({
     layers: [
-        { type: LayerType.INPUT, shape: [28, 28, 1] }, // 28x28 grayscale image
-        { type: LayerType.CONV2D, kernelSize: 3, filters: 16, activation: ActivationType.RELU },
+        { type: LayerType.INPUT, shape: [28, 28, 1] }, // [height, width, channels]
+        { type: LayerType.CONV2D, kernelSize: 3, filters: 16, padding: 1, activation: ActivationType.RELU },
         { type: LayerType.MAXPOOL2D, poolSize: 2 },
         { type: LayerType.FLATTEN },
-        { type: LayerType.DENSE, size: 10 }, // Output layer for 10 classes
+        { type: LayerType.DENSE, size: 10 },
     ],
     trainingBatchSize: 32,
 });
 
 await nn.initialize("he");
 ```
+
+### ⚙️ Configuration Details
+
+#### Layer Types
+| Layer Type | Properties | Description |
+|------------|------------|-------------|
+| `INPUT` | `shape: number[]` | Input dimensions, e.g., `[size]` or `[h, w, c]`. |
+| `DENSE` | `size: number`, `activation?` | Fully connected layer. |
+| `CONV2D` | `kernelSize`, `filters`, `stride?`, `padding?`, `activation?` | 2D Convolutional layer. |
+| `MAXPOOL2D`| `poolSize`, `stride?` | 2D Max Pooling layer. |
+| `FLATTEN` | (none) | Flattens multi-dimensional input for Dense layers. |
+
+#### Activation Types
+- `RELU`, `SIGMOID`, `TANH`, `SOFTMAX`, `LINEAR`
+
+#### Initialization Methods
+- `xavier`: Good for Sigmoid/Tanh.
+- `he`: Recommended for ReLU.
+- `uniform`: Random values between -0.1 and 0.1.
+- `zero`: Initializes all parameters to 0.
 
 ### 2. Forward Pass (Inference)
 
@@ -98,21 +119,28 @@ await nn.train({
 `scs-neural` excels at evaluating large populations in parallel, which is ideal for reinforcement learning or neuroevolution.
 
 ```typescript
+// populationWeights[layerIndex][genomeIndex] = Float32Array
 const { activations } = await nn.evaluatePopulation({
     populationSize: 100,
     batchSize: 1,
     weights: populationWeights,
     biases: populationBiases,
-    inputs: populationInputs,
+    inputs: populationInputs, // Array of Float32Arrays [populationSize]
     returnActivations: true
 });
 ```
+
+#### GA Implementation Notes
+- **Weight Structure**: Weights and biases must be provided as a 2D array: `[layerIndex][genomeIndex]`. `layerIndex` corresponds to the layer position in your architecture (skipping the input layer).
+- **Supported Layers**: Currently supports `DENSE`, `CONV2D`, and `FLATTEN` for genetic evaluation.
+- **Limitations**: `MAXPOOL2D` is currently only supported for standard backpropagation training and is not yet available for genetic evaluation.
 
 ## 🧪 Examples
 
 This repository contains several examples showcasing the library:
 
-- **Flappy Bird Genetic Algorithm**: Training birds to play Flappy Bird using parallel genetic evaluation.
+- **Ant Warfare (New)**: A complex simulation of two competing ant colonies evolving strategies via CNN-based neuroevolution.
+- **Flappy Bird Genetic Algorithm**: Evolving simple neural networks to play Flappy Bird.
 - **Color Inversion**: Standard supervised training to invert RGB colors.
 
 To run the examples locally:

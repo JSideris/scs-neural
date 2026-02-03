@@ -223,6 +223,98 @@ export class GameRenderer {
     ctx.restore();
   }
 
+  private drawQueen(ctx: CanvasRenderingContext2D, colony: Colony, px: number, py: number, tileSize: number) {
+    const size = tileSize * 2;
+    const cx = px + size / 2;
+    const cy = py + size / 2;
+
+    const isRed = colony === Colony.RED;
+    const baseColor = isRed ? '#b71c1c' : '#212121';
+    const midColor = isRed ? '#d32f2f' : '#424242';
+    const highlightColor = isRed ? '#f44336' : '#616161';
+    const strokeColor = isRed ? '#7f0000' : '#000000';
+
+    ctx.save();
+    if (colony === Colony.BLACK) {
+      ctx.translate(cx, cy);
+      ctx.rotate(Math.PI);
+      ctx.translate(-cx, -cy);
+    }
+
+    // 1. Legs (underneath) - Centered around the thorax (cx, cy)
+    ctx.strokeStyle = strokeColor;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    // Front legs (reaching towards bottom-right sides)
+    ctx.moveTo(cx + 2, cy + 2); ctx.lineTo(cx + 12, cy + 4);
+    ctx.moveTo(cx + 2, cy + 2); ctx.lineTo(cx + 4, cy + 12);
+    // Middle legs (reaching towards middle sides)
+    ctx.moveTo(cx, cy); ctx.lineTo(cx + 10, cy - 6);
+    ctx.moveTo(cx, cy); ctx.lineTo(cx - 6, cy + 10);
+    // Back legs (reaching towards top-left sides)
+    ctx.moveTo(cx - 2, cy - 2); ctx.lineTo(cx - 10, cy);
+    ctx.moveTo(cx - 2, cy - 2); ctx.lineTo(cx, cy - 10);
+    ctx.stroke();
+
+    // 2. Abdomen (large back part, top-left)
+    ctx.fillStyle = baseColor;
+    ctx.strokeStyle = strokeColor;
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.ellipse(cx - 8, cy - 8, 12, 9, Math.PI / 4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+
+    // Abdomen segments
+    ctx.beginPath();
+    ctx.strokeStyle = strokeColor;
+    ctx.setLineDash([3, 4]);
+    ctx.ellipse(cx - 7, cy - 7, 9, 6, Math.PI / 4, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // 3. Thorax (middle part - Centered)
+    ctx.fillStyle = midColor;
+    ctx.beginPath();
+    ctx.ellipse(cx, cy, 7, 5, Math.PI / 4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+
+    // 4. Head (front part, bottom-right)
+    ctx.fillStyle = midColor;
+    ctx.beginPath();
+    ctx.ellipse(cx + 8, cy + 8, 5, 4.5, Math.PI / 4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+
+    // Eyes
+    ctx.fillStyle = '#000';
+    ctx.beginPath();
+    ctx.arc(cx + 10, cy + 7.5, 1.5, 0, Math.PI * 2);
+    ctx.arc(cx + 7.5, cy + 10, 1.5, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Antennae (reaching towards bottom-right)
+    ctx.strokeStyle = strokeColor;
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    // Right antenna
+    ctx.moveTo(cx + 9, cy + 9);
+    ctx.quadraticCurveTo(cx + 14, cy + 14, cx + 16, cy + 8);
+    // Left antenna
+    ctx.moveTo(cx + 9, cy + 9);
+    ctx.quadraticCurveTo(cx + 14, cy + 14, cx + 8, cy + 16);
+    ctx.stroke();
+
+    // 5. Highlights
+    ctx.fillStyle = highlightColor;
+    ctx.beginPath();
+    ctx.ellipse(cx - 12, cy - 12, 4, 2, Math.PI / 4, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.restore();
+  }
+
   public render(ctx: CanvasRenderingContext2D, game: AntWarfareGame) {
     const tileSize = GameRenderer.TILE_SIZE;
     ctx.clearRect(0, 0, game.width * tileSize, game.height * tileSize);
@@ -233,24 +325,16 @@ export class GameRenderer {
         const px = x * tileSize;
         const py = y * tileSize;
 
+        // Always draw dirt as background
+        this.drawDirt(ctx, x, y, px, py, tileSize);
+
         switch (type) {
-          case TileType.DIRT:
-            this.drawDirt(ctx, x, y, px, py, tileSize);
-            break;
           case TileType.FOOD:
             this.drawFood(ctx, x, y, px, py, tileSize);
             break;
           case TileType.ROCK:
             const rock = game.rocks.get(`${x},${y}`) || { x, y, damage: 0, seed: (x * 7 + y * 13) % 100 / 100 };
             this.drawRock(ctx, rock, px, py, tileSize);
-            break;
-          case TileType.RED_QUEEN:
-            ctx.fillStyle = '#b71c1c';
-            ctx.fillRect(px, py, tileSize, tileSize);
-            break;
-          case TileType.BLACK_QUEEN:
-            ctx.fillStyle = '#212121';
-            ctx.fillRect(px, py, tileSize, tileSize);
             break;
           case TileType.RED_EGG:
             ctx.fillStyle = '#ffcdd2';
@@ -280,6 +364,10 @@ export class GameRenderer {
         }
       }
     }
+
+    // Render Queens on top of everything except ants
+    this.drawQueen(ctx, Colony.RED, game.QUEEN_POSITIONS[Colony.RED].x * tileSize, game.QUEEN_POSITIONS[Colony.RED].y * tileSize, tileSize);
+    this.drawQueen(ctx, Colony.BLACK, game.QUEEN_POSITIONS[Colony.BLACK].x * tileSize, game.QUEEN_POSITIONS[Colony.BLACK].y * tileSize, tileSize);
 
     // Render Ants
     for (const ant of game.ants) {

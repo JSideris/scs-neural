@@ -36,6 +36,7 @@ export interface Ant {
   bornOnRock: boolean;
   maxHealth: number;
   isGrownUp: boolean;
+  ticksBesideQueen: number;
 }
 
 export interface Egg {
@@ -166,12 +167,20 @@ export class AntWarfareGame {
       for (let dx = -1; dx <= 2 && count < 12; dx++) {
         const nx = qpos.x + dx;
         const ny = qpos.y + dy;
-        if (nx >= 0 && nx < this.width && ny >= 0 && ny < this.height) {
-          if (this.grid[ny][nx] === TileType.DIRT || this.grid[ny][nx] === TileType.ROCK) {
-            const isRock = this.grid[ny][nx] === TileType.ROCK;
+        if (this.isValidPos(nx, ny)) {
+          const targetTile = this.grid[ny][nx];
+          if (targetTile === TileType.DIRT || targetTile === TileType.ROCK || targetTile === TileType.FOOD) {
+            const isRock = targetTile === TileType.ROCK;
+            const isFood = targetTile === TileType.FOOD;
+
             this.grid[ny][nx] = type;
             this.eggs.push({ colony, x: nx, y: ny, hatchProgress: 0, bornOnRock: isRock });
             if (isRock) this.rocks.delete(`${nx},${ny}`);
+            
+            if (isFood) {
+              this.hatchEgg(this.eggs.length - 1);
+            }
+            
             count++;
           }
         }
@@ -208,7 +217,7 @@ export class AntWarfareGame {
     }
   }
 
-  public update(antDecisions: Map<number, { move: number, attack: boolean, dropFood: boolean, pheromones: boolean[] }>) {
+  public update(antDecisions: Map<number, { move: number, dropFood: boolean, pheromones: boolean[] }>) {
     this.frameCount++;
 
     // Fade pheromones
@@ -253,7 +262,7 @@ export class AntWarfareGame {
     for (const ant of shuffledAnts) {
       if (ant.isDead) continue;
 
-      const decision = antDecisions.get(ant.id) || { move: 0, attack: false, dropFood: false, pheromones: [] };
+      const decision = antDecisions.get(ant.id) || { move: 0, dropFood: false, pheromones: [] };
       
       // Hunger decay
       let currentStarveRate = this.STARVE_RATE;
@@ -278,6 +287,19 @@ export class AntWarfareGame {
 
       if (ant.health <= 0) {
         this.killAnt(ant);
+        continue;
+      }
+
+      // Stagnation check: Beside Queen
+      const qpos = this.QUEEN_POSITIONS[ant.colony];
+      if (ant.x >= qpos.x - 1 && ant.x <= qpos.x + 2 && ant.y >= qpos.y - 1 && ant.y <= qpos.y + 2) {
+        ant.ticksBesideQueen++;
+      } else {
+        ant.ticksBesideQueen = 0;
+      }
+
+      if (ant.ticksBesideQueen > 10) {
+        this.convertAntToEgg(ant);
         continue;
       }
 
@@ -323,16 +345,8 @@ export class AntWarfareGame {
         if (this.isValidPos(targetX, targetY)) {
           const targetTile = this.grid[targetY][targetX];
           
-          // Attack
-          if (decision.attack && (targetTile === TileType.RED_ANT || targetTile === TileType.BLACK_ANT)) {
-            const otherAnt = this.ants.find(a => !a.isDead && a.x === targetX && a.y === targetY);
-            if (otherAnt && otherAnt.colony !== ant.colony) {
-              this.performAttack(ant, otherAnt);
-              ant.hunger -= this.ATTACK_HUNGER_COST;
-            }
-          } 
           // Move to DIRT/FOOD/EGG
-          else if (targetTile === TileType.DIRT || targetTile === TileType.FOOD || targetTile === TileType.RED_EGG || targetTile === TileType.BLACK_EGG) {
+          if (targetTile === TileType.DIRT || targetTile === TileType.FOOD || targetTile === TileType.RED_EGG || targetTile === TileType.BLACK_EGG) {
             
             // Interaction with egg
             if (targetTile === TileType.RED_EGG || targetTile === TileType.BLACK_EGG) {
@@ -445,6 +459,9 @@ export class AntWarfareGame {
         ant.hunger = Math.min(AntWarfareGame.MAX_HUNGER, ant.hunger + this.FOOD_HUNGER_RESTORE);
         ant.foodCarried--;
       }
+
+      // Automatic attacks at end of turn
+      this.handleAutomaticAttacks(ant);
     }
 
     // Queen auto-egg if colony is empty
@@ -454,6 +471,24 @@ export class AntWarfareGame {
 
   private isValidPos(x: number, y: number) {
     return x >= 0 && x < this.width && y >= 0 && y < this.height;
+  }
+
+  private handleAutomaticAttacks(ant: Ant) {
+    const directions = [{ dx: 0, dy: -1 }, { dx: 0, dy: 1 }, { dx: -1, dy: 0 }, { dx: 1, dy: 0 }];
+    for (const dir of directions) {
+      const tx = ant.x + dir.dx;
+      const ty = ant.y + dir.dy;
+      if (this.isValidPos(tx, ty)) {
+        const targetTile = this.grid[ty][tx];
+        if (targetTile === TileType.RED_ANT || targetTile === TileType.BLACK_ANT) {
+          const otherAnt = this.ants.find(a => !a.isDead && a.x === tx && a.y === ty);
+          if (otherAnt && otherAnt.colony !== ant.colony) {
+            this.performAttack(ant, otherAnt);
+            ant.hunger -= this.ATTACK_HUNGER_COST;
+          }
+        }
+      }
+    }
   }
 
   private performAttack(attacker: Ant, target: Ant) {
@@ -472,6 +507,14 @@ export class AntWarfareGame {
     if (target.health <= 0) {
       attacker.kills++;
       this.killAnt(target);
+
+      // Replenish hunger on kill
+      attacker.hunger = AntWarfareGame.MAX_HUNGER;
+
+      // Youth ant growth bonus (counts as 2 snacks)
+      if (!attacker.isGrownUp) {
+        attacker.foodCollected += 2;
+      }
     }
   }
 
@@ -499,6 +542,19 @@ export class AntWarfareGame {
         this.rocks.set(`${ant.x},${ant.y}`, { x: ant.x, y: ant.y, damage: 0, seed: Math.random() });
       }
     }
+  }
+
+  private convertAntToEgg(ant: Ant) {
+    ant.isDead = true;
+    const type = ant.colony === Colony.RED ? TileType.RED_EGG : TileType.BLACK_EGG;
+    this.grid[ant.y][ant.x] = type;
+    this.eggs.push({ 
+      colony: ant.colony, 
+      x: ant.x, 
+      y: ant.y, 
+      hatchProgress: 0, 
+      bornOnRock: false 
+    });
   }
 
   private shareFood(ant: Ant) {
@@ -544,11 +600,18 @@ export class AntWarfareGame {
         const nx = qpos.x + dx;
         const ny = qpos.y + dy;
         if (this.isValidPos(nx, ny)) {
-            if (this.grid[ny][nx] === TileType.DIRT || this.grid[ny][nx] === TileType.ROCK) {
-                const isRock = this.grid[ny][nx] === TileType.ROCK;
+            const targetTile = this.grid[ny][nx];
+            if (targetTile === TileType.DIRT || targetTile === TileType.ROCK || targetTile === TileType.FOOD) {
+                const isRock = targetTile === TileType.ROCK;
+                const isFood = targetTile === TileType.FOOD;
+
                 this.grid[ny][nx] = type;
                 this.eggs.push({ colony, x: nx, y: ny, hatchProgress: 0, bornOnRock: isRock });
                 if (isRock) this.rocks.delete(`${nx},${ny}`);
+                
+                if (isFood) {
+                  this.hatchEgg(this.eggs.length - 1);
+                }
                 return;
             }
         }
@@ -600,7 +663,8 @@ export class AntWarfareGame {
       ],
       bornOnRock: egg.bornOnRock,
       maxHealth: AntWarfareGame.MAX_HEALTH,
-      isGrownUp: false
+      isGrownUp: false,
+      ticksBesideQueen: 0
     };
 
     // If there was an ant already there, move them out or replace?
@@ -650,7 +714,7 @@ export class AntWarfareGame {
   public getAntState(ant: Ant) {
     const INPUT_H = 7;
     const INPUT_W = 7;
-    const INPUT_C = 21;
+    const INPUT_C = 23;
     const inputs = new Float32Array(INPUT_H * INPUT_W * INPUT_C);
     
     // Shared scalar values
@@ -661,7 +725,12 @@ export class AntWarfareGame {
     const qpos = this.QUEEN_POSITIONS[ant.colony];
     const qdx = qpos.x - ant.x;
     const qdy = qpos.y - ant.y;
-    const distToQueen = Math.min(1.0, Math.sqrt(qdx*qdx + qdy*qdy) / 50);
+    const dist = Math.sqrt(qdx*qdx + qdy*qdy);
+    const normQdx = dist > 0 ? qdx / dist : 0;
+    const normQdy = dist > 0 ? qdy / dist : 0;
+
+    const colonySize = this.ants.filter(a => a.colony === ant.colony && !a.isDead).length;
+    const normalizedColonySize = Math.min(1.0, colonySize / 50);
 
     // Fill 7x7 grid
     for (let dy = -3; dy <= 3; dy++) {
@@ -704,19 +773,23 @@ export class AntWarfareGame {
           inputs[baseIdx + 1] = 1;
         }
 
-        // 4 Tiled Scalars (11-14)
+        // 5 Tiled Scalars (11-15)
         inputs[baseIdx + 11] = health;
         inputs[baseIdx + 12] = hunger;
         inputs[baseIdx + 13] = foodCarried;
-        inputs[baseIdx + 14] = distToQueen;
+        inputs[baseIdx + 14] = normQdx;
+        inputs[baseIdx + 15] = normQdy;
 
-        // 6 Move History Scalars (15-20)
+        // 6 Move History Scalars (16-21)
         // Store the last 3 moves: (dx1, dy1, dx2, dy2, dx3, dy3)
         for (let i = 0; i < 3; i++) {
           const move = ant.moveHistory[i] || { dx: 0, dy: 0 };
-          inputs[baseIdx + 15 + i * 2] = move.dx;
-          inputs[baseIdx + 16 + i * 2] = move.dy;
+          inputs[baseIdx + 16 + i * 2] = move.dx;
+          inputs[baseIdx + 17 + i * 2] = move.dy;
         }
+
+        // 1 Colony Size Scalar (22)
+        inputs[baseIdx + 22] = normalizedColonySize;
       }
     }
 

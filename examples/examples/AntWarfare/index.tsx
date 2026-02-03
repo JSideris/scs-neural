@@ -2,8 +2,10 @@ import React, { useEffect, useRef, useState } from 'react';
 import { NeuralNetwork, ActivationType, LayerType } from '../../../src';
 import { AntWarfareGame, Ant, Colony } from './game';
 import { GameRenderer } from './graphics';
+import { Genome, runPretraining, INPUT_H, INPUT_W, INPUT_C, OUTPUT_SIZE } from './pretraining';
 import { StatCard } from '../../components/StatCard';
-import { Play, Pause, RotateCcw, Save, Upload } from 'lucide-react';
+import { LossGraph } from '../../components/LossGraph';
+import { Play, Pause, RotateCcw, Save, Upload, Zap, Brain } from 'lucide-react';
 
 const DB_NAME = 'AntWarfareDB';
 const STORE_NAME = 'genomes';
@@ -44,19 +46,14 @@ const loadFromDB = async (key: string): Promise<any> => {
   });
 };
 
-interface Genome {
-  weights: Float32Array[];
-  biases: Float32Array[];
-  id: number; // Matches ant.id
-  fitness?: number;
-}
-
 export const AntWarfare: React.FC = () => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [generation, setGeneration] = useState(0);
   const [redCount, setRedCount] = useState(0);
   const [blackCount, setBlackCount] = useState(0);
   const [isRunning, setIsRunning] = useState(false);
+  const [isTraining, setIsTraining] = useState(false);
+  const [trainingHistory, setTrainingHistory] = useState<{ epochs: number[], losses: number[] }>({ epochs: [], losses: [] });
   const [error, setError] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   
@@ -96,8 +93,7 @@ export const AntWarfare: React.FC = () => {
   const initializingRef = useRef(false);
   const isRunningRef = useRef(false);
 
-  const INPUT_SHAPE = [7, 7, 21]; // (7*7 grid with 21 channels)
-  const OUTPUT_SIZE = 9; // Move(5), Drop(1), Attack(1), Phero0(1), Phero1(1)
+  const INPUT_SHAPE = [INPUT_H, INPUT_W, INPUT_C];
 
   useEffect(() => {
     if (initializingRef.current) return;
@@ -252,6 +248,7 @@ export const AntWarfare: React.FC = () => {
 
   const scrambleColony = (colony: Colony) => {
     if (!gameRef.current) return;
+    const game = gameRef.current;
     
     // Clear Hall of Fame for this colony
     if (colony === Colony.RED) {
@@ -264,7 +261,7 @@ export const AntWarfare: React.FC = () => {
 
     // Generate new random genomes for all living ants in this colony
     const genomes = colony === Colony.RED ? redGenomesRef.current : blackGenomesRef.current;
-    const livingAnts = gameRef.current.ants.filter(a => a.colony === colony && !a.isDead);
+    const livingAnts = game.ants.filter(a => a.colony === colony && !a.isDead);
     
     livingAnts.forEach(ant => {
       genomes.set(ant.id, createRandomGenome(ant.id));
@@ -278,42 +275,6 @@ export const AntWarfare: React.FC = () => {
     game.lastFoodFrame[colony] = game.frameCount;
     
     showStatus(`${colony === Colony.RED ? 'Red' : 'Black'} colony scrambled due to stagnation!`);
-  };
-
-  const checkStagnation = () => {
-    if (!gameRef.current) return;
-    const game = gameRef.current;
-    
-    // Wait at least 2000 frames from game start
-    if (game.frameCount < 2000) return;
-
-    [Colony.RED, Colony.BLACK].forEach(colony => {
-      const framesSinceFood = game.frameCount - game.lastFoodFrame[colony];
-      const framesSinceScramble = game.frameCount - lastScrambleFrameRef.current[colony];
-      
-      // Criteria: 
-      // 1. 1500+ frames since last food
-      // 2. Ensure at least 1000 frames since last scramble
-      if (framesSinceFood > 1500 && framesSinceScramble > 1000) {
-        const livingAnts = game.ants.filter(a => a.colony === colony && !a.isDead);
-        if (livingAnts.length > 0) {
-          // 3. Average unique directions < 1.5
-          let totalDirections = 0;
-          livingAnts.forEach(ant => {
-            const count = (ant.directionsAttempted.up ? 1 : 0) + 
-                          (ant.directionsAttempted.down ? 1 : 0) + 
-                          (ant.directionsAttempted.left ? 1 : 0) + 
-                          (ant.directionsAttempted.right ? 1 : 0);
-            totalDirections += count;
-          });
-          const avgDirections = totalDirections / livingAnts.length;
-          
-          if (avgDirections < 1.5) {
-            scrambleColony(colony);
-          }
-        }
-      }
-    });
   };
 
   const runStep = async () => {
@@ -349,7 +310,7 @@ export const AntWarfare: React.FC = () => {
             returnActivations: true,
         });
 
-        const decisions = new Map<number, { move: number, attack: boolean, dropFood: boolean, pheromones: boolean[] }>();
+        const decisions = new Map<number, { move: number, dropFood: boolean, pheromones: boolean[] }>();
         
         for (let i = 0; i < aliveAnts.length; i++) {
             const ant = aliveAnts[i];
@@ -358,8 +319,7 @@ export const AntWarfare: React.FC = () => {
             // Output interpretation:
             // 0-4: Move (Stay, Up, Down, Left, Right)
             // 5: Drop Food
-            // 6: Attack
-            // 7-8: Pheromones
+            // 6-7: Pheromones
             
             let move = 0;
             let maxMoveVal = output[0];
@@ -382,13 +342,11 @@ export const AntWarfare: React.FC = () => {
             decisions.set(ant.id, {
                 move,
                 dropFood: output[5] > 0.5,
-                attack: output[6] > 0.5,
-                pheromones: [output[7] > 0.5, output[8] > 0.5]
+                pheromones: [output[6] > 0.5, output[7] > 0.5]
             });
         }
 
         game.update(decisions);
-        checkStagnation();
         
         // Track best genomes
         aliveAnts.forEach(ant => {
@@ -522,6 +480,50 @@ export const AntWarfare: React.FC = () => {
     setTimeout(() => setStatusMessage(null), 3000);
   };
 
+  const handlePretrain = async () => {
+    if (!nnRef.current) return;
+    setIsTraining(true);
+    setTrainingHistory({ epochs: [], losses: [] });
+    setStatusMessage("Generating synthetic scenarios...");
+
+    try {
+      const trainedGenome = await runPretraining(nnRef.current, (epoch, loss) => {
+        setTrainingHistory(prev => ({
+          epochs: [...prev.epochs, epoch],
+          losses: [...prev.losses, loss]
+        }));
+        if (epoch % 10 === 0) {
+          console.log(`Pre-train Epoch ${epoch}: Loss ${loss.toFixed(6)}`);
+        }
+      });
+
+      setStatusMessage("Reading trained weights...");
+      
+      // Inject into Hall of Fame
+      redHallOfFameRef.current = [trainedGenome];
+      blackHallOfFameRef.current = [trainedGenome];
+      bestRedGenomeRef.current = trainedGenome;
+      bestBlackGenomeRef.current = trainedGenome;
+
+      // Update all living ants
+      if (gameRef.current) {
+        gameRef.current.ants.forEach(ant => {
+          if (!ant.isDead) {
+            const genomes = ant.colony === Colony.RED ? redGenomesRef.current : blackGenomesRef.current;
+            genomes.set(ant.id, cloneAndMutate(trainedGenome, ant.id, 0.01));
+          }
+        });
+      }
+
+      showStatus("Foundational instincts calibrated! Ants now crave food.");
+    } catch (err) {
+      console.error("Pre-training failed:", err);
+      setError("Pre-training failed: " + (err as Error).message);
+    } finally {
+      setIsTraining(false);
+    }
+  };
+
   const resetGame = () => {
     setIsRunning(false);
     isRunningRef.current = false;
@@ -587,6 +589,7 @@ export const AntWarfare: React.FC = () => {
           <div style={{ display: 'flex', gap: '1rem' }}>
             <button
               onClick={toggleRunning}
+              disabled={isTraining}
               style={{
                 flex: 1,
                 display: 'flex',
@@ -598,7 +601,8 @@ export const AntWarfare: React.FC = () => {
                 color: 'white',
                 borderRadius: '0.5rem',
                 border: 'none',
-                cursor: 'pointer',
+                cursor: isTraining ? 'not-allowed' : 'pointer',
+                opacity: isTraining ? 0.5 : 1,
                 fontWeight: 600
               }}
             >
@@ -606,14 +610,38 @@ export const AntWarfare: React.FC = () => {
               {isRunning ? 'Pause' : 'Start Evolution'}
             </button>
             <button
+              onClick={handlePretrain}
+              disabled={isRunning || isTraining}
+              style={{
+                flex: 1,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                gap: '0.5rem',
+                padding: '0.75rem',
+                backgroundColor: '#6366f1',
+                color: 'white',
+                borderRadius: '0.5rem',
+                border: 'none',
+                cursor: (isRunning || isTraining) ? 'not-allowed' : 'pointer',
+                opacity: (isRunning || isTraining) ? 0.5 : 1,
+                fontWeight: 600
+              }}
+            >
+              <Zap size={20} />
+              {isTraining ? 'Training...' : 'Pre-train Instincts'}
+            </button>
+            <button
               onClick={resetGame}
+              disabled={isTraining}
               style={{
                 padding: '0.75rem',
                 backgroundColor: '#334155',
                 color: '#94a3b8',
                 borderRadius: '0.5rem',
                 border: 'none',
-                cursor: 'pointer'
+                cursor: isTraining ? 'not-allowed' : 'pointer',
+                opacity: isTraining ? 0.5 : 1,
               }}
             >
               <RotateCcw size={20} />
@@ -623,6 +651,7 @@ export const AntWarfare: React.FC = () => {
           <div style={{ display: 'flex', gap: '1rem' }}>
             <button
               onClick={saveModel}
+              disabled={isTraining}
               style={{
                 flex: 1,
                 display: 'flex',
@@ -634,7 +663,8 @@ export const AntWarfare: React.FC = () => {
                 color: '#f8fafc',
                 borderRadius: '0.5rem',
                 border: 'none',
-                cursor: 'pointer',
+                cursor: isTraining ? 'not-allowed' : 'pointer',
+                opacity: isTraining ? 0.5 : 1,
                 fontWeight: 600
               }}
             >
@@ -643,6 +673,7 @@ export const AntWarfare: React.FC = () => {
             </button>
             <button
               onClick={loadModel}
+              disabled={isTraining}
               style={{
                 flex: 1,
                 display: 'flex',
@@ -654,7 +685,8 @@ export const AntWarfare: React.FC = () => {
                 color: '#f8fafc',
                 borderRadius: '0.5rem',
                 border: 'none',
-                cursor: 'pointer',
+                cursor: isTraining ? 'not-allowed' : 'pointer',
+                opacity: isTraining ? 0.5 : 1,
                 fontWeight: 600
               }}
             >
@@ -662,6 +694,16 @@ export const AntWarfare: React.FC = () => {
               Load Model
             </button>
           </div>
+
+          {trainingHistory.epochs.length > 0 && !isRunning && (
+            <div style={{ marginTop: '1rem' }}>
+              <LossGraph 
+                epochs={trainingHistory.epochs} 
+                losses={trainingHistory.losses} 
+                title="Pre-training Instincts (Backprop)"
+              />
+            </div>
+          )}
 
           {statusMessage && (
             <div style={{
@@ -682,24 +724,7 @@ export const AntWarfare: React.FC = () => {
         <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
           <StatCard label="Red Colony" value={redCount} />
           <StatCard label="Black Colony" value={blackCount} />
-          
-          <div style={{ 
-            background: '#1e293b', 
-            padding: '1.25rem', 
-            borderRadius: '0.5rem', 
-            border: '1px solid #334155',
-            marginTop: '1rem'
-          }}>
-            <h4 style={{ fontSize: '0.875rem', fontWeight: 600, color: '#f8fafc', marginBottom: '0.75rem' }}>Legend:</h4>
-            <ul style={{ fontSize: '0.8125rem', color: '#94a3b8', paddingLeft: '1.25rem', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-              <li><span style={{ color: '#b71c1c' }}>■</span> Red Queen / Ant</li>
-              <li><span style={{ color: '#212121' }}>■</span> Black Queen / Ant</li>
-              <li><span style={{ color: '#4caf50' }}>■</span> Food</li>
-              <li><span style={{ color: '#9e9e9e' }}>■</span> Rock</li>
-              <li><span style={{ color: '#ffcdd2' }}>●</span> Red Egg</li>
-              <li><span style={{ color: '#f5f5f5' }}>●</span> Black Egg</li>
-            </ul>
-          </div>
+        
 
           <div style={{ 
             background: '#1e293b', 
@@ -710,10 +735,12 @@ export const AntWarfare: React.FC = () => {
             <h4 style={{ fontSize: '0.875rem', fontWeight: 600, color: '#f8fafc', marginBottom: '0.75rem' }}>Rules:</h4>
             <ul style={{ fontSize: '0.8125rem', color: '#94a3b8', paddingLeft: '1.25rem', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
               <li>Ants evolve continuously via mutation.</li>
-              <li>Hatching ants inherit from the most successful living ant.</li>
+              <li>Hatching ants inherit from the most successful ants in a "hall of fame."</li>
               <li>Gather food to feed the queen for more eggs.</li>
               <li>Push rocks to clear paths or block enemies.</li>
-              <li>Protect your queen! Defence is higher near her.</li>
+              <li>Ants feed the queen/hatchlings, defeat enemies, eat snacks, or just explore to gain fitness.</li>
+              <li>Ants that eat a lot of snacks get stronger.</li>
+              <li>Lazy ants get removed from the gene pool.</li>
             </ul>
           </div>
         </div>

@@ -1,6 +1,6 @@
 {
   "name": "scs-neural",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A WebGPU-powered neural network library built on simple-compute-shaders.",
   "license": "ISC",
   "author": "Joshua Sideris",
